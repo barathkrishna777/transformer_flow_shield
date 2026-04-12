@@ -1,0 +1,397 @@
+Continuous-Space MAPF with Learned Planning + Collision Shield
+
+Agentic Research Execution Plan
+
+1. Main Research Idea
+
+Title
+
+Decentralized Continuous-Space MAPF via Learned Flow-Based Planning with PIBT-Inspired Collision Shielding
+
+Core Hypothesis
+
+A learned decentralized planner (e.g., transformer trained via flow matching) can capture long-horizon coordination and liveness, but requires a continuous collision shield to guarantee safety and resolve local conflicts—analogous to how PIBT operates in grid MAPF.
+
+Architecture Overview
+
+Planner (Learned)
+
+Input: local observations (neighbor states, goals, map context)
+
+Output: continuous motion intent (velocity / short trajectory / flow field)
+
+Trained via: imitation learning / flow matching / trajectory supervision
+
+Collision Shield (Analytical / Rule-based / Optimization-based)
+
+Input: proposed motion from planner
+
+Output: safe, minimally modified motion
+
+Key mechanisms:
+
+Priority assignment + inheritance
+
+Local collision avoidance
+
+Backtracking / yielding
+
+Minimal deviation from intent
+
+Key Contributions
+
+Continuous analogue of PIBT-style collision resolution
+
+Decentralized, scalable continuous MAPF solver
+
+Separation of:
+
+Global reasoning (ML)
+
+Local safety (shield)
+
+2. Supporting / Related Work (Agent Instructions)
+
+Goal
+
+Build a retrievable research knowledge base for repeated use.
+
+Search Topics
+
+The agent should search and collect papers/code under:
+
+MAPF (Core)
+
+PIBT (Priority Inheritance Backtracking)
+
+ECBS / EECBS / CBS variants
+
+Decentralized MAPF
+
+Lifelong MAPF
+
+Liveness guarantees
+
+Continuous Multi-Agent Planning
+
+ORCA (Optimal Reciprocal Collision Avoidance)
+
+RVO / HRVO
+
+Velocity obstacles
+
+Control barrier functions (CBFs) for multi-agent systems
+
+Decentralized MPC for collision avoidance
+
+Learning-Based Planning
+
+Transformer-based planning
+
+Decentralized policies for multi-agent navigation
+
+Graph neural networks for MAPF
+
+Diffusion / flow matching / rectified flow models
+
+Trajectory prediction models (multi-agent)
+
+Hybrid Systems (Closest to Our Idea)
+
+Learning + safety filter
+
+RL + CBF
+
+Shielded RL
+
+Safe motion planning with learned priors
+
+Data Collection Instructions
+
+Folder Structure
+
+research/
+  ├── mapf/
+  ├── continuous_planning/
+  ├── learning_based/
+  ├── hybrid_methods/
+  ├── notes/
+  └── summaries/
+
+
+For Each Paper
+
+Store the following structure:
+
+paper_name/
+  ├── paper.pdf
+  ├── summary.md
+  ├── key_points.json
+  └── citations.bib
+
+
+summary.md Format
+
+Problem setup
+
+Key idea
+
+Strengths
+
+Weaknesses
+
+Relevance to our idea
+
+Reusable components
+
+key_points.json Format
+
+{
+  "method_type": "",
+  "centralized": true/false,
+  "continuous": true/false,
+  "uses_learning": true/false,
+  "handles_liveness": true/false,
+  "collision_method": "",
+  "notes": ""
+}
+
+
+Retrieval Optimization
+
+Build an embedding index over summaries.
+
+Tag papers with:
+
+"collision"
+
+"liveness"
+
+"decentralized"
+
+"continuous"
+
+"learning"
+
+Enable queries like:
+
+"continuous decentralized collision avoidance"
+
+"learning-based MAPF with guarantees"
+
+3. Experimentation Plan
+
+Benchmark
+
+Use Moving AI MAPF benchmark.
+
+Start with:
+
+Empty maps
+
+Then obstacle maps
+
+Then dense scenarios
+
+Phase 0: Infrastructure Setup
+
+Simulator: Continuous 2D environment, circular agents with radius.
+
+Dataset Generation: Generate expert trajectories:
+
+Straight-line optimal motion (empty map)
+
+ORCA / simple planner for obstacles
+
+Phase 1: Minimal Setup (No Obstacles)
+
+Goal: Test if learned planner + shield works in simplest setting.
+
+Setup:
+
+Map: empty
+
+Agents: small number (5–20)
+
+Model: Small transformer
+
+Input: neighbor states + goal
+
+Output: velocity vector
+
+Experiments:
+
+Learned planner only
+
+Learned planner + collision shield
+
+Metrics: Collision rate, Time to goal, Smoothness, Deadlocks
+
+Implementation status:
+
+- Phase 0 implemented in `flow_shield`: continuous 2D simulator, circular agents, empty-map straight-line expert, scenario generation, observation encoding, and dataset save/load.
+- Phase 1 implemented in `flow_shield`: NumPy attention policy, supervised training, collision shield comparison, metrics, CLI pipeline, and tests.
+- Run end-to-end with `python3 -m flow_shield.cli phase1 --output-dir runs/phase1`.
+- Phase 2 implemented in `flow_shield`: explicit shield variants/factory, no-shield and velocity-clip baselines, pairwise projection, priority yielding, PIBT-inspired priority inheritance/backtracking prototype, adversarial scenario suite, richer safety/correction metrics, CLI ablation runner, and tests.
+- Run shield ablations with `python3 -m flow_shield.cli phase2 --output results/phase2_ablations.json`.
+
+Phase 2: Introduce Collision Shield
+
+Shield Design Variants:
+
+Simple: Velocity clipping, Pairwise avoidance
+
+Intermediate: Priority-based yielding
+
+Advanced: Priority inheritance graph, Local backtracking
+
+Compare: No shield vs. shield variants
+
+Implementation status:
+
+- Added variants: `none`, `velocity_clip`, `pairwise`, `priority`, and `pibt`.
+- Added adversarial scenarios: two-agent swap, multi-agent crossing, dense circle/ring swap, and corridor-like bottleneck. The bottleneck is represented by starts/goals because static obstacles are not active yet.
+- Added metrics: collision rate, pair collisions per run, mean/max min-separation violation, mean/max shield correction norm, smoothness, time to goal, success rate, and deadlock rate.
+- Prototype limitation: the PIBT-inspired shield is a one-step local heuristic with priority inheritance and greedy backtracking. It exposes unresolved final conflicts in diagnostics/metrics rather than claiming global PIBT liveness guarantees.
+
+Phase 3: Obstacle Maps
+
+Add: Static obstacles from Moving AI maps.
+
+New challenges: Narrow passages, Congestion.
+
+Evaluate: Liveness (do agents get stuck?), Throughput, Success rate.
+
+Implementation status:
+
+- Phase 3 implemented in `flow_shield`: Moving AI `type octile` `.map` parsing, continuous blocked-cell obstacle representation, simulator obstacle projection/reporting, obstacle collision/separation metrics, obstacle-free start/goal sampling with radius clearance and A* reachability checks, per-agent grid A* waypoint expert velocities, obstacle-context observation tokens, map-aware shield diagnostics/projection, and focused tests.
+- Added Phase 3 CLI/data workflow:
+  - `python3 -m flow_shield.cli phase3 --map tests/fixtures/tiny_obstacle.map --output-dir runs/phase3`
+  - `python3 -m flow_shield.cli generate-data --scenario-type obstacle_map --map tests/fixtures/tiny_obstacle.map --max-obstacle-tokens 8 --output datasets/phase3_obstacle_train.npz`
+- Expected Phase 3 artifacts: `phase3_obstacle_dataset.npz`, `phase3_policy.npz`, and `phase3_results.json`.
+- Limitations: the expert is per-agent A* plus continuous waypoint following, not a joint CBS/ECBS expert; Moving AI `.scen` benchmark-pair import is not implemented; Phase 3 evaluates one static map at a time and surfaces unresolved obstacle/agent interactions in JSON metrics and shield diagnostics.
+
+Phase 4: Scaling Model + Data
+
+Increase: Number of agents (20 → 100+), Map size, Training data.
+
+Improve model: Larger transformer, Add attention over neighbors, Possibly graph structure.
+
+Implementation status:
+
+- Phase 4 implemented in `flow_shield`: scaled empty-map scenario/data generation supports larger agent counts, map sizes, neighbor windows, horizons, reproducible seeds, and optional sample caps for CPU-bounded runs. Phase 4 can also run obstacle-map scaling through the Phase 3 Moving AI map path with `scenario_type="obstacle_map"`, `map_path`, and nonzero `max_obstacle_tokens`.
+- Added a configurable phase 4 experiment path with a NumPy transformer-style policy interface. The current scalable backend uses a fixed random multi-head attention encoder and trains a ridge-regression output head. PyTorch is not a required dependency; runs detect/report PyTorch and CUDA availability in `backend_diagnostics`.
+- Added scaled evaluation over Phase 2 shield variants (`none`, `velocity_clip`, `pairwise`, `priority`, and `pibt`) with the existing rollout/evaluation APIs.
+- Added throughput/scaling metrics: `steps_per_second`, `agents_per_second`, and `mean_agents_per_run`, while preserving collision rate, pair collisions, min-separation violation, shield correction norms, smoothness, time to goal, success rate, and deadlock rate.
+- Added Phase 4 CLI commands:
+  - `python3 -m flow_shield.cli phase4 --output-dir runs/phase4`
+  - `python3 -m flow_shield.cli phase4-eval --model runs/phase4/phase4_policy.npz --output results/phase4_eval.json`
+- Expected Phase 4 artifacts: `phase4_scaled_dataset.npz`, `phase4_policy.npz`, and `phase4_results.json`.
+- Prototype limitation: Phase 4 obstacle scaling now uses the Phase 3 static-map sampler and per-agent A* expert on one Moving AI map at a time. It still does not import `.scen` benchmark tasks or train a full PyTorch/GPU transformer backend.
+
+Phase 5: Learned + Shield Co-Design
+
+Ideas:
+
+Train model with shield in loop.
+
+Penalize motions that require heavy correction.
+
+Predict uncertainty / confidence.
+
+Phase 6: Advanced Shield Improvements
+
+Priority inheritance graph (PIBT-like)
+
+Multi-step conflict resolution
+
+Temporary goal reassignment
+
+Backtracking policies
+
+Phase 7: Stress Testing
+
+Dense crowd scenarios
+
+Narrow corridors
+
+Adversarial setups
+
+4. Additional Components
+
+A. Code Structure
+
+project/
+  ├── models/
+  ├── shield/
+  ├── simulator/
+  ├── training/
+  ├── evaluation/
+  └── configs/
+
+
+B. Evaluation Metrics
+
+Safety: Collision rate, Minimum distance violations
+
+Efficiency: Time to goal, Path optimality
+
+Liveness: % agents reaching goal, Deadlock frequency
+
+Stability: Oscillation / jitter
+
+C. Ablations
+
+No shield vs. shield
+
+Different shield strengths
+
+Model size
+
+Training data size
+
+With vs. without obstacles
+
+D. Visualization
+
+Trajectory plots
+
+Collision heatmaps
+
+Priority propagation visualization
+
+E. Key Risks
+
+Shield too conservative → kills performance
+
+Shield too weak → collisions
+
+Learned policy ignores shield behavior
+
+Deadlocks in dense environments
+
+F. Stretch Goals
+
+Real robot deployment (ROS2 + multi-robot)
+
+Extend to SE(2) / dynamics
+
+Integrate with MPC
+
+Theoretical guarantees (safety / liveness bounds)
+
+5. Final Instruction to Agent
+
+You are responsible for:
+
+Building a structured research knowledge base.
+
+Implementing a minimal working pipeline quickly.
+
+Iteratively scaling complexity.
+
+Continuously comparing: Learned-only vs. Learned+Shield.
+
+Logging everything for reproducibility.
+
+Core Directive: Focus on fast iteration first, sophistication later.

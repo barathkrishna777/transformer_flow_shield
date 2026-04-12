@@ -1,0 +1,542 @@
+"""Expert data generation for phase 0 continuous-space MAPF."""
+
+from __future__ import annotations
+
+import heapq
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+from .config import DatasetConfig, SimConfig
+from .geometry import clip_by_norm, collision_pairs, project_positions_to_bounds
+from .maps import GridMap, load_obstacle_map
+from .simulator import ContinuousWorld, Scenario, sim_config_for_scenario
+
+
+def straight_line_velocity(
+    positions: np.ndarray,
+    goals: np.ndarray,
+    config: SimConfig,
+) -> np.ndarray:
+    """Empty-map optimal velocity intent: move straight toward each goal."""
+
+    deltas = np.asarray(goals, dtype=np.float64) - np.asarray(positions, dtype=np.float64)
+    distances = np.linalg.norm(deltas, axis=1, keepdims=True)
+    desired = deltas / np.maximum(distances, 1e-8)
+    speeds = np.minimum(config.max_speed, distances / max(config.dt, 1e-8))
+    velocities = desired * speeds
+    velocities[distances[:, 0] <= config.goal_tolerance] = 0.0
+    return clip_by_norm(velocities, config.max_speed)
+
+
+def obstacle_aware_velocity(
+    positions: np.ndarray,
+    goals: np.ndarray,
+    config: SimConfig,
+    static_obstacles: Tuple[Tuple[float, float, float], ...],
+) -> np.ndarray:
+    """Legacy circular-obstacle potential-field intent for static_obstacles."""
+
+    velocities = straight_line_velocity(positions, goals, config)
+    if not static_obstacles:
+        return velocities
+    corrections = np.zeros_like(velocities)
+    influence = 1.25
+    for x, y, radius in static_obstacles:
+        center = np.array([x, y], dtype=np.float64)
+        delta = positions - center[None, :]
+        distances = np.linalg.norm(delta, axis=1, keepdims=True)
+        clearance = distances - radius - config.agent_radius
+        active = clearance < influence
+        direction = delta / np.maximum(distances, 1e-8)
+        strength = np.maximum(0.0, (influence - clearance) / influence)
+        corrections += direction * strength * config.max_speed * active
+    return clip_by_norm(velocities + corrections, config.max_speed)
+
+
+_NEIGHBOR_DELTAS = (
+    (-1, 0, 1.0),
+    (1, 0, 1.0),
+    (0, -1, 1.0),
+    (0, 1, 1.0),
+    (-1, -1, np.sqrt(2.0)),
+    (-1, 1, np.sqrt(2.0)),
+    (1, -1, np.sqrt(2.0)),
+    (1, 1, np.sqrt(2.0)),
+)
+
+
+def _cell_has_clearance(
+    obstacle_map: GridMap,
+    row: int,
+    col: int,
+    radius: float,
+    margin: float,
+) -> bool:
+    if not obstacle_map.is_cell_free(row, col):
+        return False
+    return not obstacle_map.circle_collides(
+        obstacle_map.cell_center(row, col),
+        radius,
+        margin=margin,
+    )
+
+
+def _nearest_clear_cell(
+    obstacle_map: GridMap,
+    point: np.ndarray,
+    radius: float,
+    margin: float,
+) -> Optional[Tuple[int, int]]:
+    start = obstacle_map.point_to_cell(point)
+    if _cell_has_clearance(obstacle_map, start[0], start[1], radius, margin):
+        return start
+    free_rows, free_cols = np.nonzero(~obstacle_map.blocked)
+    if free_rows.size == 0:
+        return None
+    centers = np.column_stack(
+        [
+            (free_cols.astype(np.float64) + 0.5) * obstacle_map.cell_size,
+            (free_rows.astype(np.float64) + 0.5) * obstacle_map.cell_size,
+        ]
+    )
+    distances = np.linalg.norm(centers - np.asarray(point, dtype=np.float64)[None, :], axis=1)
+    for index in np.argsort(distances):
+        row = int(free_rows[index])
+        col = int(free_cols[index])
+        if _cell_has_clearance(obstacle_map, row, col, radius, margin):
+            return row, col
+    return None
+
+
+def _octile_heuristic(a: Tuple[int, int], b: Tuple[int, int]) -> float:
+    dr = abs(a[0] - b[0])
+    dc = abs(a[1] - b[1])
+    diagonal = min(dr, dc)
+    straight = max(dr, dc) - diagonal
+    return float(diagonal * np.sqrt(2.0) + straight)
+
+
+def astar_grid_path(
+    obstacle_map: GridMap,
+    start: np.ndarray,
+    goal: np.ndarray,
+    radius: float,
+    margin: float = 0.0,
+) -> Optional[List[Tuple[int, int]]]:
+    """Plan a clearance-aware octile-grid path over a Moving AI map."""
+
+    start_cell = _nearest_clear_cell(obstacle_map, start, radius, margin)
+    goal_cell = _nearest_clear_cell(obstacle_map, goal, radius, margin)
+    if start_cell is None or goal_cell is None:
+        return None
+    if start_cell == goal_cell:
+        return [start_cell]
+
+    open_heap: List[Tuple[float, float, Tuple[int, int]]] = []
+    heapq.heappush(open_heap, (_octile_heuristic(start_cell, goal_cell), 0.0, start_cell))
+    came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    best_cost: Dict[Tuple[int, int], float] = {start_cell: 0.0}
+    closed = set()
+
+    while open_heap:
+        _, cost, cell = heapq.heappop(open_heap)
+        if cell in closed:
+            continue
+        if cell == goal_cell:
+            path = [cell]
+            while cell in came_from:
+                cell = came_from[cell]
+                path.append(cell)
+            return list(reversed(path))
+        closed.add(cell)
+        row, col = cell
+        for dr, dc, step_cost in _NEIGHBOR_DELTAS:
+            next_cell = (row + dr, col + dc)
+            if not _cell_has_clearance(
+                obstacle_map,
+                next_cell[0],
+                next_cell[1],
+                radius,
+                margin,
+            ):
+                continue
+            if dr != 0 and dc != 0:
+                if not (
+                    _cell_has_clearance(obstacle_map, row + dr, col, radius, margin)
+                    and _cell_has_clearance(obstacle_map, row, col + dc, radius, margin)
+                ):
+                    continue
+            new_cost = cost + float(step_cost)
+            if new_cost + 1e-12 >= best_cost.get(next_cell, np.inf):
+                continue
+            best_cost[next_cell] = new_cost
+            came_from[next_cell] = cell
+            priority = new_cost + _octile_heuristic(next_cell, goal_cell)
+            heapq.heappush(open_heap, (priority, new_cost, next_cell))
+    return None
+
+
+def obstacle_map_velocity(
+    positions: np.ndarray,
+    goals: np.ndarray,
+    config: SimConfig,
+    obstacle_map: GridMap,
+    radii: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """A* waypoint-following expert for static Moving AI obstacle maps."""
+
+    positions = np.asarray(positions, dtype=np.float64)
+    goals = np.asarray(goals, dtype=np.float64)
+    radii = (
+        np.full(positions.shape[0], config.agent_radius, dtype=np.float64)
+        if radii is None
+        else np.asarray(radii, dtype=np.float64)
+    )
+    targets = goals.copy()
+    waypoint_tolerance = max(config.goal_tolerance * 0.75, config.agent_radius * 1.5)
+    for index, (position, goal, radius) in enumerate(zip(positions, goals, radii)):
+        if np.linalg.norm(goal - position) <= config.goal_tolerance:
+            targets[index] = position
+            continue
+        path = astar_grid_path(
+            obstacle_map,
+            position,
+            goal,
+            float(radius),
+            margin=config.safety_margin,
+        )
+        if not path:
+            targets[index] = position
+            continue
+        waypoints = [obstacle_map.cell_center(row, col) for row, col in path[1:]]
+        waypoints.append(goal)
+        for waypoint in waypoints:
+            if np.linalg.norm(waypoint - position) > waypoint_tolerance:
+                targets[index] = waypoint
+                break
+        else:
+            targets[index] = goal
+    return straight_line_velocity(positions, targets, config)
+
+
+def _sample_points(
+    rng: np.random.Generator,
+    count: int,
+    config: SimConfig,
+    min_pair_distance: float,
+    forbidden: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    points: List[np.ndarray] = []
+    lower = config.agent_radius
+    upper = np.asarray(config.world_size, dtype=np.float64) - config.agent_radius
+    forbidden = np.empty((0, 2), dtype=np.float64) if forbidden is None else forbidden
+    attempts = 0
+    attempt_limit = max(20000, int(count) * 1000)
+    while len(points) < count and attempts < attempt_limit:
+        attempts += 1
+        candidate = rng.uniform(lower, upper, size=2)
+        existing = np.vstack([forbidden, np.asarray(points).reshape(-1, 2)])
+        if existing.size == 0:
+            points.append(candidate)
+            continue
+        distances = np.linalg.norm(existing - candidate[None, :], axis=1)
+        if np.all(distances >= min_pair_distance):
+            points.append(candidate)
+    if len(points) != count and forbidden.size == 0:
+        points = _grid_sample_points(
+            rng,
+            count,
+            lower,
+            upper,
+            min_pair_distance,
+        )
+    if len(points) != count:
+        raise RuntimeError(
+            "Could not sample non-overlapping points; reduce agent count/radius "
+            "or increase world_size."
+        )
+    return np.asarray(points, dtype=np.float64)
+
+
+def _grid_sample_points(
+    rng: np.random.Generator,
+    count: int,
+    lower: float,
+    upper: np.ndarray,
+    min_pair_distance: float,
+) -> List[np.ndarray]:
+    """Fallback sampler for dense scaled empty-map starts."""
+
+    width = np.maximum(upper - lower, 0.0)
+    grid_counts = np.floor(width / max(min_pair_distance, 1e-8)).astype(int) + 1
+    if int(np.prod(grid_counts)) < count:
+        return []
+    xs = np.linspace(lower, upper[0], grid_counts[0])
+    ys = np.linspace(lower, upper[1], grid_counts[1])
+    grid = np.array(np.meshgrid(xs, ys), dtype=np.float64).reshape(2, -1).T
+    order = rng.permutation(grid.shape[0])[:count]
+    return [grid[index] for index in order]
+
+
+def _sample_obstacle_free_points(
+    rng: np.random.Generator,
+    count: int,
+    config: SimConfig,
+    obstacle_map: GridMap,
+    min_pair_distance: float,
+    forbidden: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    points: List[np.ndarray] = []
+    forbidden = np.empty((0, 2), dtype=np.float64) if forbidden is None else forbidden
+    attempts = 0
+    attempt_limit = max(50000, int(count) * 5000)
+    clearance_margin = config.safety_margin
+    while len(points) < count and attempts < attempt_limit:
+        attempts += 1
+        candidate = obstacle_map.random_free_point(
+            rng,
+            radius=config.agent_radius,
+            margin=clearance_margin,
+        )
+        existing = np.vstack([forbidden, np.asarray(points).reshape(-1, 2)])
+        if existing.size:
+            distances = np.linalg.norm(existing - candidate[None, :], axis=1)
+            if not np.all(distances >= min_pair_distance):
+                continue
+        points.append(candidate)
+    if len(points) != count:
+        raise RuntimeError(
+            "Could not sample non-overlapping obstacle-free points; reduce agent "
+            "count/radius or choose a less constrained map."
+        )
+    return np.asarray(points, dtype=np.float64)
+
+
+def sample_empty_scenario(
+    rng: np.random.Generator,
+    num_agents: int,
+    sim_config: SimConfig,
+    dataset_config: DatasetConfig,
+) -> Scenario:
+    """Sample starts and goals in an empty box without initial overlaps."""
+
+    min_pair_distance = 2.5 * sim_config.agent_radius + sim_config.safety_margin
+    starts = _sample_points(rng, num_agents, sim_config, min_pair_distance)
+    goals: List[np.ndarray] = []
+    attempts = 0
+    lower = sim_config.agent_radius
+    upper = np.asarray(sim_config.world_size, dtype=np.float64) - sim_config.agent_radius
+    goal_attempt_limit = max(30000, int(num_agents) * 2000)
+    while len(goals) < num_agents and attempts < goal_attempt_limit:
+        attempts += 1
+        candidate = rng.uniform(lower, upper, size=2)
+        if np.linalg.norm(candidate - starts[len(goals)]) < dataset_config.min_start_goal_distance:
+            continue
+        existing = np.asarray(goals).reshape(-1, 2) if goals else np.empty((0, 2))
+        if existing.size and np.any(np.linalg.norm(existing - candidate[None, :], axis=1) < min_pair_distance):
+            continue
+        goals.append(candidate)
+    if len(goals) != num_agents:
+        raise RuntimeError("Could not sample valid goals for scenario.")
+    radii = np.full(num_agents, sim_config.agent_radius, dtype=np.float64)
+    return Scenario(
+        starts=starts,
+        goals=np.asarray(goals, dtype=np.float64),
+        radii=radii,
+        world_size=sim_config.world_size,
+    )
+
+
+def sample_obstacle_map_scenario(
+    rng: np.random.Generator,
+    num_agents: int,
+    sim_config: SimConfig,
+    dataset_config: DatasetConfig,
+    obstacle_map: GridMap,
+) -> Scenario:
+    """Sample starts/goals in free space on a static obstacle map."""
+
+    map_config = sim_config_for_scenario(
+        sim_config,
+        Scenario(
+            starts=np.empty((0, 2), dtype=np.float64),
+            goals=np.empty((0, 2), dtype=np.float64),
+            radii=np.empty((0,), dtype=np.float64),
+            world_size=obstacle_map.world_size,
+            obstacle_map=obstacle_map,
+        ),
+    )
+    min_pair_distance = 2.5 * map_config.agent_radius + map_config.safety_margin
+    starts = _sample_obstacle_free_points(
+        rng,
+        num_agents,
+        map_config,
+        obstacle_map,
+        min_pair_distance,
+    )
+    goals: List[np.ndarray] = []
+    attempts = 0
+    goal_attempt_limit = max(80000, int(num_agents) * 8000)
+    while len(goals) < num_agents and attempts < goal_attempt_limit:
+        attempts += 1
+        candidate = obstacle_map.random_free_point(
+            rng,
+            radius=map_config.agent_radius,
+            margin=map_config.safety_margin,
+        )
+        agent_index = len(goals)
+        if np.linalg.norm(candidate - starts[agent_index]) < dataset_config.min_start_goal_distance:
+            continue
+        existing = np.asarray(goals).reshape(-1, 2) if goals else np.empty((0, 2))
+        if existing.size and np.any(
+            np.linalg.norm(existing - candidate[None, :], axis=1) < min_pair_distance
+        ):
+            continue
+        path = astar_grid_path(
+            obstacle_map,
+            starts[agent_index],
+            candidate,
+            map_config.agent_radius,
+            margin=map_config.safety_margin,
+        )
+        if not path:
+            continue
+        goals.append(candidate)
+    if len(goals) != num_agents:
+        raise RuntimeError(
+            "Could not sample valid obstacle-map goals with a collision-free A* path."
+        )
+    radii = np.full(num_agents, map_config.agent_radius, dtype=np.float64)
+    return Scenario(
+        starts=starts,
+        goals=np.asarray(goals, dtype=np.float64),
+        radii=radii,
+        world_size=obstacle_map.world_size,
+        obstacle_map=obstacle_map,
+    )
+
+
+def rollout_expert(
+    scenario: Scenario,
+    sim_config: SimConfig,
+    horizon: int,
+) -> List[dict]:
+    """Roll out the phase 0 expert and return pre-step states plus targets."""
+
+    world = ContinuousWorld(scenario, sim_config)
+    records: List[dict] = []
+    for _ in range(horizon):
+        scenario_config = sim_config_for_scenario(sim_config, scenario)
+        if scenario.obstacle_map is not None:
+            target_velocity = obstacle_map_velocity(
+                world.positions,
+                world.goals,
+                scenario_config,
+                scenario.obstacle_map,
+                radii=world.radii,
+            )
+        elif scenario.static_obstacles:
+            target_velocity = obstacle_aware_velocity(
+                world.positions,
+                world.goals,
+                scenario_config,
+                scenario.static_obstacles,
+            )
+        else:
+            target_velocity = straight_line_velocity(
+                world.positions,
+                world.goals,
+                scenario_config,
+            )
+        records.append(
+            {
+                "positions": world.positions.copy(),
+                "velocities": world.velocities.copy(),
+                "goals": world.goals.copy(),
+                "radii": world.radii.copy(),
+                "target_velocities": target_velocity.copy(),
+                "reached": world.reached_goals().copy(),
+            }
+        )
+        world.step(target_velocity)
+        if world.all_reached():
+            break
+    return records
+
+
+def generate_scenarios(
+    dataset_config: DatasetConfig,
+    sim_config: SimConfig,
+) -> List[Scenario]:
+    """Generate phase 0 scenarios."""
+
+    rng = np.random.default_rng(dataset_config.seed)
+    scenarios = []
+    count_choices = tuple(int(count) for count in dataset_config.agent_count_choices)
+    obstacle_map = load_obstacle_map(
+        dataset_config.map_path,
+        cell_size=dataset_config.map_cell_size,
+    )
+    scenario_type = dataset_config.scenario_type.strip().lower().replace("-", "_")
+    if scenario_type in {"moving_ai", "moving_ai_map", "map"}:
+        scenario_type = "obstacle_map"
+    if scenario_type == "obstacle_map" and obstacle_map is None:
+        raise ValueError("scenario_type='obstacle_map' requires DatasetConfig.map_path.")
+    if scenario_type == "empty" and obstacle_map is not None:
+        scenario_type = "obstacle_map"
+    for _ in range(dataset_config.num_scenarios):
+        if scenario_type not in {"empty", "obstacle_map"}:
+            raise ValueError(
+                f"Unsupported scenario_type={dataset_config.scenario_type!r}; "
+                "expected 'empty' or 'obstacle_map'."
+            )
+        num_agents = (
+            int(rng.choice(count_choices))
+            if count_choices
+            else dataset_config.num_agents
+        )
+        if scenario_type == "obstacle_map":
+            assert obstacle_map is not None
+            scenario = sample_obstacle_map_scenario(
+                rng,
+                num_agents,
+                sim_config,
+                dataset_config,
+                obstacle_map,
+            )
+        else:
+            scenario = sample_empty_scenario(
+                rng,
+                num_agents,
+                sim_config,
+                dataset_config,
+            )
+        if collision_pairs(scenario.starts, scenario.radii):
+            raise RuntimeError("Generated an initially colliding scenario.")
+        if scenario.obstacle_map is not None:
+            obstacle_collisions = scenario.obstacle_map.circle_collisions(
+                scenario.starts,
+                scenario.radii,
+                margin=sim_config.safety_margin,
+            )
+            if obstacle_collisions:
+                raise RuntimeError("Generated an initially obstacle-colliding scenario.")
+        scenario = Scenario(
+            starts=project_positions_to_bounds(
+                scenario.starts,
+                scenario.radii,
+                scenario.world_size,
+            ),
+            goals=project_positions_to_bounds(
+                scenario.goals,
+                scenario.radii,
+                scenario.world_size,
+            ),
+            radii=scenario.radii,
+            world_size=scenario.world_size,
+            static_obstacles=scenario.static_obstacles,
+            obstacle_map=scenario.obstacle_map,
+        )
+        scenarios.append(scenario)
+    return scenarios

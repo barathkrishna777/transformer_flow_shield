@@ -479,6 +479,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     benchmark.add_argument("--limit", type=int, default=None)
     benchmark.add_argument("--smoke", action="store_true")
+    benchmark.add_argument(
+        "--case-timeout-seconds",
+        type=float,
+        default=None,
+        help="Optional per-case wall-clock timeout; timed-out cases are recorded as failures and the batch continues.",
+    )
+    benchmark.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="Still write progress files, but do not echo per-case JSONL progress to stdout.",
+    )
     benchmark.add_argument("--plan-only", "--dry-run", action="store_true", dest="plan_only")
 
     return parser
@@ -618,6 +629,8 @@ def main() -> None:
             plan,
             output_dir=args.output_dir,
             plan_only=args.plan_only,
+            echo_progress=not args.quiet_progress,
+            case_timeout_seconds=args.case_timeout_seconds,
         )
         print(json.dumps(summary, indent=2))
         return

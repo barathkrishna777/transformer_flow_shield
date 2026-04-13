@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import signal
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from time import perf_counter, time
 from typing import Dict, Iterable, List, Optional
 
 from .config import DatasetConfig, ModelConfig, SimConfig
@@ -142,16 +145,71 @@ def write_benchmark_plan(plan: Dict[str, object], output_dir: str | Path) -> Pat
     return path
 
 
+def _append_progress(path: Path, event: Dict[str, object], echo: bool) -> None:
+    """Append one JSONL progress event and optionally echo it to stdout."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "wall_time": time(),
+        **event,
+    }
+    line = json.dumps(payload, sort_keys=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+    if echo:
+        print(line, flush=True)
+
+
+def _write_status(path: Path, status: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+
+
+@contextmanager
+def _case_timeout(seconds: Optional[float]):
+    """Raise TimeoutError after seconds on Unix-like systems."""
+
+    if seconds is None or float(seconds) <= 0.0 or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _handler(signum, frame):  # pragma: no cover - signal timing path.
+        del signum, frame
+        raise TimeoutError(f"case exceeded timeout_seconds={float(seconds)}")
+
+    previous = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, float(seconds))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def run_benchmark_plan(
     plan: Dict[str, object],
     output_dir: str | Path,
     plan_only: bool = False,
+    echo_progress: bool = True,
+    case_timeout_seconds: Optional[float] = None,
 ) -> Dict[str, object]:
     """Execute a benchmark plan case-by-case or just write the plan."""
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     plan_path = write_benchmark_plan(plan, output_dir)
+    progress_path = output_dir / "benchmark_progress.jsonl"
+    status_path = output_dir / "benchmark_status.json"
+    _append_progress(
+        progress_path,
+        {
+            "event": "plan_written",
+            "plan_path": str(plan_path),
+            "case_count": int(plan.get("case_count", 0)),
+            "plan_only": bool(plan_only),
+        },
+        echo=echo_progress,
+    )
     if plan_only:
         summary = {
             "phase": "phase7_benchmark_orchestration",
@@ -161,16 +219,52 @@ def run_benchmark_plan(
             "results": [],
             "failed": [],
             "skipped": [],
+            "progress_path": str(progress_path),
+            "status_path": str(status_path),
         }
         summary_path = output_dir / "benchmark_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        _write_status(
+            status_path,
+            {
+                "state": "plan_only",
+                "case_count": int(plan.get("case_count", 0)),
+                "summary_path": str(summary_path),
+            },
+        )
         return summary
 
     results = []
     failed = []
     skipped = []
-    for case in plan.get("cases", []):
+    cases = list(plan.get("cases", []))
+    total_start = perf_counter()
+    for index, case in enumerate(cases):
         case_output = output_dir / str(case["case_id"])
+        case_start = perf_counter()
+        case_status = {
+            "state": "running",
+            "case_index": index,
+            "case_count": len(cases),
+            "case_id": case["case_id"],
+            "map_path": case.get("map_path"),
+            "scen_path": case.get("scen_path"),
+            "num_agents": case.get("num_agents"),
+            "expert_type": case.get("expert_type"),
+            "case_output": str(case_output),
+            "completed_count": len(results),
+            "failed_count": len(failed),
+            "timeout_seconds": case_timeout_seconds,
+        }
+        _write_status(status_path, case_status)
+        _append_progress(
+            progress_path,
+            {
+                "event": "case_start",
+                **case_status,
+            },
+            echo=echo_progress,
+        )
         try:
             sim_config = SimConfig(
                 max_steps=int(case["max_steps"]),
@@ -200,34 +294,57 @@ def run_benchmark_plan(
                 batch_size=64,
                 seed=int(case["seed"]) + 17,
             )
-            result = run_phase3_experiment(
-                output_dir=case_output,
-                map_path=case["map_path"],
-                sim_config=sim_config,
-                dataset_config=dataset_config,
-                model_config=model_config,
-                eval_scenarios=int(case["eval_scenarios"]),
-                variants=("none", "pairwise"),
-                max_iterations=3,
-            )
+            with _case_timeout(case_timeout_seconds):
+                result = run_phase3_experiment(
+                    output_dir=case_output,
+                    map_path=case["map_path"],
+                    sim_config=sim_config,
+                    dataset_config=dataset_config,
+                    model_config=model_config,
+                    eval_scenarios=int(case["eval_scenarios"]),
+                    variants=("none", "pairwise"),
+                    max_iterations=3,
+                )
             per_map_path = case_output / "phase3_results.json"
-            results.append(
+            case_result = {
+                "case_id": case["case_id"],
+                "result_path": str(per_map_path),
+                "success": True,
+                "elapsed_seconds": float(perf_counter() - case_start),
+                "metrics": result.get("metrics", {}),
+            }
+            results.append(case_result)
+            _append_progress(
+                progress_path,
                 {
+                    "event": "case_complete",
                     "case_id": case["case_id"],
+                    "elapsed_seconds": case_result["elapsed_seconds"],
                     "result_path": str(per_map_path),
-                    "success": True,
-                    "metrics": result.get("metrics", {}),
-                }
+                    "completed_count": len(results),
+                    "failed_count": len(failed),
+                },
+                echo=echo_progress,
             )
         except Exception as exc:  # pragma: no cover - failure reporting path.
-            failed.append(
+            failure = {
+                "case_id": case.get("case_id", "unknown"),
+                "map_path": case.get("map_path"),
+                "scen_path": case.get("scen_path"),
+                "reason": type(exc).__name__,
+                "message": str(exc),
+                "elapsed_seconds": float(perf_counter() - case_start),
+            }
+            failed.append(failure)
+            _append_progress(
+                progress_path,
                 {
-                    "case_id": case.get("case_id", "unknown"),
-                    "map_path": case.get("map_path"),
-                    "scen_path": case.get("scen_path"),
-                    "reason": type(exc).__name__,
-                    "message": str(exc),
-                }
+                    "event": "case_failed",
+                    **failure,
+                    "completed_count": len(results),
+                    "failed_count": len(failed),
+                },
+                echo=echo_progress,
             )
     summary = {
         "phase": "phase7_benchmark_orchestration",
@@ -237,10 +354,37 @@ def run_benchmark_plan(
         "completed_count": len(results),
         "failed_count": len(failed),
         "skipped_count": len(skipped),
+        "elapsed_seconds": float(perf_counter() - total_start),
+        "progress_path": str(progress_path),
+        "status_path": str(status_path),
         "results": results,
         "failed": failed,
         "skipped": skipped,
     }
     summary_path = output_dir / "benchmark_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _write_status(
+        status_path,
+        {
+            "state": "complete",
+            "case_count": len(cases),
+            "completed_count": len(results),
+            "failed_count": len(failed),
+            "skipped_count": len(skipped),
+            "elapsed_seconds": summary["elapsed_seconds"],
+            "summary_path": str(summary_path),
+        },
+    )
+    _append_progress(
+        progress_path,
+        {
+            "event": "benchmark_complete",
+            "summary_path": str(summary_path),
+            "completed_count": len(results),
+            "failed_count": len(failed),
+            "skipped_count": len(skipped),
+            "elapsed_seconds": summary["elapsed_seconds"],
+        },
+        echo=echo_progress,
+    )
     return summary

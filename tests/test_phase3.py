@@ -495,13 +495,22 @@ class PhaseThreeObstacleMapTests(unittest.TestCase):
                 limit=1,
                 smoke=True,
             )
-            summary = run_benchmark_plan(plan, output_dir, plan_only=True)
+            summary = run_benchmark_plan(
+                plan,
+                output_dir,
+                plan_only=True,
+                echo_progress=False,
+            )
             self.assertFalse(summary["executed"])
             self.assertTrue((output_dir / "benchmark_plan.json").exists())
             self.assertTrue((output_dir / "benchmark_summary.json").exists())
+            self.assertTrue((output_dir / "benchmark_progress.jsonl").exists())
+            self.assertTrue((output_dir / "benchmark_status.json").exists())
             written = json.loads((output_dir / "benchmark_plan.json").read_text(encoding="utf-8"))
             self.assertEqual(written["case_count"], 1)
             self.assertEqual(written["cases"][0]["expert_type"], "prioritized_astar")
+            status = json.loads((output_dir / "benchmark_status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["state"], "plan_only")
 
 
 if __name__ == "__main__":

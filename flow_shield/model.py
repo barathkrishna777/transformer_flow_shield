@@ -1,8 +1,9 @@
-"""NumPy attention policy for phase 1 learned planning."""
+"""Policy models for learned continuous-space MAPF planning."""
 
 from __future__ import annotations
 
 import json
+import importlib.util
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -12,6 +13,10 @@ from .config import ModelConfig, SimConfig
 from .dataset import FEATURE_DIM, encode_joint_observation, normalize_observation_version
 from .geometry import clip_by_norm
 from .maps import GridMap
+
+
+def _torch_available() -> bool:
+    return importlib.util.find_spec("torch") is not None
 
 
 def _softmax(scores: np.ndarray) -> np.ndarray:
@@ -631,30 +636,354 @@ class NumpyTransformerPolicy:
         return model
 
 
+class TorchTransformerPolicy:
+    """Trainable PyTorch transformer planner with the same rollout API.
+
+    PyTorch remains an optional dependency. This class is selected explicitly
+    with ``policy_type='torch_transformer'`` and is intended for Lambda/GPU
+    training while preserving the existing observation, dataset, and shield
+    evaluation pipeline.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int = FEATURE_DIM,
+        d_model: int = 128,
+        num_heads: int = 4,
+        num_layers: int = 3,
+        max_speed: float = 1.2,
+        dropout: float = 0.0,
+        device: str = "auto",
+        seed: int = 0,
+    ):
+        if not _torch_available():
+            raise ImportError(
+                "PyTorch is required for policy_type='torch_transformer'. "
+                "Install torch in the Lambda environment or use numpy_transformer."
+            )
+        import torch
+        import torch.nn as nn
+
+        self.feature_dim = int(feature_dim)
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
+        self.max_speed = float(max_speed)
+        self.dropout = float(dropout)
+        self.observation_version = "legacy"
+        self.observation_metadata: Dict[str, object] = {}
+        if self.d_model <= 0:
+            raise ValueError("d_model must be positive.")
+        if self.num_heads <= 0:
+            raise ValueError("num_heads must be positive.")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads.")
+        if self.num_layers <= 0:
+            raise ValueError("num_layers must be positive.")
+        torch.manual_seed(int(seed))
+        if device == "auto":
+            resolved = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            resolved = str(device)
+        self.device = torch.device(resolved)
+        self.model = _TorchTransformerModule(
+            feature_dim=self.feature_dim,
+            d_model=self.d_model,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers,
+            max_speed=self.max_speed,
+            dropout=self.dropout,
+        ).to(self.device)
+
+    @classmethod
+    def from_config(cls, config: ModelConfig, sim_config: SimConfig) -> "TorchTransformerPolicy":
+        return cls(
+            feature_dim=config.feature_dim,
+            d_model=config.d_model,
+            num_heads=config.num_heads,
+            num_layers=config.num_layers,
+            max_speed=sim_config.max_speed,
+            dropout=config.dropout,
+            device=config.torch_device,
+            seed=config.seed,
+        )
+
+    def predict_batch(self, observations: np.ndarray, masks: np.ndarray) -> np.ndarray:
+        import torch
+
+        self.model.eval()
+        obs = torch.as_tensor(observations, dtype=torch.float32, device=self.device)
+        mask = torch.as_tensor(masks, dtype=torch.bool, device=self.device)
+        with torch.no_grad():
+            predictions = self.model(obs, mask)
+        return predictions.detach().cpu().numpy().astype(np.float64)
+
+    def predict_joint(
+        self,
+        positions: np.ndarray,
+        velocities: np.ndarray,
+        goals: np.ndarray,
+        radii: np.ndarray,
+        max_neighbors: int,
+        sim_config: SimConfig,
+        obstacle_map: GridMap | None = None,
+        max_obstacle_tokens: int = 0,
+        obstacle_context_range: float = 4.0,
+        observation_version: str | None = None,
+    ) -> np.ndarray:
+        observations, masks = encode_joint_observation(
+            positions,
+            velocities,
+            goals,
+            radii,
+            max_neighbors,
+            sim_config,
+            obstacle_map=obstacle_map,
+            max_obstacle_tokens=max_obstacle_tokens,
+            obstacle_context_range=obstacle_context_range,
+            observation_version=observation_version or self.observation_version,
+        )
+        return self.predict_batch(observations, masks)
+
+    def loss(self, observations: np.ndarray, masks: np.ndarray, targets: np.ndarray) -> float:
+        predictions = self.predict_batch(observations, masks)
+        return float(np.mean((predictions - targets) ** 2))
+
+    def fit(
+        self,
+        observations: np.ndarray,
+        masks: np.ndarray,
+        targets: np.ndarray,
+        config: ModelConfig,
+        verbose: bool = False,
+    ) -> Dict[str, object]:
+        import torch
+        from torch.utils.data import DataLoader, TensorDataset
+
+        rng = np.random.default_rng(config.seed)
+        n_samples = int(observations.shape[0])
+        indices = np.arange(n_samples)
+        rng.shuffle(indices)
+        val_count = int(round(n_samples * config.validation_split))
+        val_indices = indices[:val_count]
+        train_indices = indices[val_count:] if val_count < n_samples else indices
+        if len(train_indices) == 0:
+            train_indices = indices
+
+        obs = torch.as_tensor(observations, dtype=torch.float32)
+        mask = torch.as_tensor(masks, dtype=torch.bool)
+        target = torch.as_tensor(targets, dtype=torch.float32)
+        train_ds = TensorDataset(obs[train_indices], mask[train_indices], target[train_indices])
+        generator = torch.Generator()
+        generator.manual_seed(int(config.seed))
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=max(1, int(config.batch_size)),
+            shuffle=True,
+            generator=generator,
+        )
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=float(config.learning_rate),
+            weight_decay=float(config.weight_decay),
+        )
+        history: Dict[str, object] = {
+            "train_loss": [],
+            "val_loss": [],
+            "fit_method": "torch_transformer_adamw",
+            "trained_parameters": ["all"],
+            "device": str(self.device),
+        }
+        for epoch in range(int(config.epochs)):
+            self.model.train()
+            batch_losses = []
+            for batch_obs, batch_mask, batch_target in train_loader:
+                batch_obs = batch_obs.to(self.device)
+                batch_mask = batch_mask.to(self.device)
+                batch_target = batch_target.to(self.device)
+                optimizer.zero_grad(set_to_none=True)
+                pred = self.model(batch_obs, batch_mask)
+                loss = torch.mean((pred - batch_target) ** 2)
+                loss.backward()
+                if config.grad_clip_norm and config.grad_clip_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        float(config.grad_clip_norm),
+                    )
+                optimizer.step()
+                batch_losses.append(float(loss.detach().cpu()))
+            train_loss = float(np.mean(batch_losses)) if batch_losses else 0.0
+            val_loss = (
+                self._loss_on_indices(obs, mask, target, val_indices, max(1, int(config.batch_size)))
+                if val_count
+                else train_loss
+            )
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(float(val_loss))
+            if verbose:
+                print(
+                    f"torch_transformer epoch={epoch + 1:03d} "
+                    f"train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
+                    f"device={self.device}"
+                )
+        return history
+
+    def _loss_on_indices(self, obs, mask, target, indices: np.ndarray, batch_size: int) -> float:
+        import torch
+
+        if len(indices) == 0:
+            return 0.0
+        self.model.eval()
+        total = 0.0
+        count = 0
+        with torch.no_grad():
+            for start in range(0, len(indices), batch_size):
+                batch_idx = indices[start : start + batch_size]
+                pred = self.model(obs[batch_idx].to(self.device), mask[batch_idx].to(self.device))
+                batch_target = target[batch_idx].to(self.device)
+                total += float(torch.sum((pred - batch_target) ** 2).detach().cpu())
+                count += int(pred.numel())
+        return float(total / max(count, 1))
+
+    def save(self, path: str | Path, metadata: Dict[str, object] | None = None) -> None:
+        import torch
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = metadata or {}
+        observation_version = normalize_observation_version(
+            payload.get("observation_version", self.observation_version)
+        )
+        torch.save(
+            {
+                "state_dict": self.model.state_dict(),
+                "metadata": {
+                    "feature_dim": self.feature_dim,
+                    "d_model": self.d_model,
+                    "num_heads": self.num_heads,
+                    "num_layers": self.num_layers,
+                    "max_speed": self.max_speed,
+                    "dropout": self.dropout,
+                    "policy_type": "torch_transformer",
+                    "observation_version": observation_version,
+                    "observation_metadata": payload.get(
+                        "observation_metadata",
+                        self.observation_metadata,
+                    ),
+                    "metadata": payload,
+                },
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> "TorchTransformerPolicy":
+        import torch
+
+        payload = torch.load(path, map_location="cpu")
+        metadata = payload["metadata"]
+        model = cls(
+            feature_dim=int(metadata["feature_dim"]),
+            d_model=int(metadata["d_model"]),
+            num_heads=int(metadata["num_heads"]),
+            num_layers=int(metadata["num_layers"]),
+            max_speed=float(metadata["max_speed"]),
+            dropout=float(metadata.get("dropout", 0.0)),
+            device="cpu",
+            seed=0,
+        )
+        model.model.load_state_dict(payload["state_dict"])
+        model.observation_version = normalize_observation_version(
+            metadata.get("observation_version")
+            or metadata.get("metadata", {}).get("observation_version")
+            or metadata.get("metadata", {}).get("dataset_config", {}).get("observation_version")
+        )
+        model.observation_metadata = dict(metadata.get("observation_metadata", {}))
+        return model
+
+
+class _TorchTransformerModule:
+    def __new__(
+        cls,
+        feature_dim: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        max_speed: float,
+        dropout: float,
+    ):
+        import torch
+        import torch.nn as nn
+
+        class Module(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.max_speed = float(max_speed)
+                self.input = nn.Linear(int(feature_dim), int(d_model))
+                layer = nn.TransformerEncoderLayer(
+                    d_model=int(d_model),
+                    nhead=int(num_heads),
+                    dim_feedforward=int(d_model) * 4,
+                    dropout=float(dropout),
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                self.encoder = nn.TransformerEncoder(layer, num_layers=int(num_layers))
+                self.head = nn.Sequential(
+                    nn.LayerNorm(int(d_model) + int(feature_dim)),
+                    nn.Linear(int(d_model) + int(feature_dim), int(d_model)),
+                    nn.GELU(),
+                    nn.Linear(int(d_model), 2),
+                )
+
+            def forward(self, observations, masks):
+                x = self.input(observations)
+                x = torch.where(masks[:, :, None], x, torch.zeros_like(x))
+                encoded = self.encoder(x, src_key_padding_mask=~masks)
+                self_token = encoded[:, 0, :]
+                features = torch.cat([self_token, observations[:, 0, :]], dim=-1)
+                return torch.tanh(self.head(features)) * self.max_speed
+
+        return Module()
+
+
 def make_policy(config: ModelConfig, sim_config: SimConfig):
     policy_type = config.policy_type.strip().lower().replace("-", "_")
     if policy_type in {"attention", "numpy_attention", "phase1_attention"}:
         return NumpyAttentionPolicy.from_config(config, sim_config)
     if policy_type in {"transformer", "numpy_transformer", "scaled_numpy_transformer"}:
         return NumpyTransformerPolicy.from_config(config, sim_config)
+    if policy_type in {"torch_transformer", "pytorch_transformer"}:
+        return TorchTransformerPolicy.from_config(config, sim_config)
     raise ValueError(
-        "Unknown policy_type={!r}; expected 'numpy_attention' or 'numpy_transformer'.".format(
+        "Unknown policy_type={!r}; expected 'numpy_attention', 'numpy_transformer', "
+        "or 'torch_transformer'.".format(
             config.policy_type
         )
     )
 
 
 def load_policy(path: str | Path):
-    data = np.load(path, allow_pickle=False)
-    metadata = json.loads(str(data["metadata"]))
-    policy_type = metadata.get("policy_type", "numpy_attention")
+    try:
+        data = np.load(path, allow_pickle=False)
+        metadata = json.loads(str(data["metadata"]))
+        policy_type = metadata.get("policy_type", "numpy_attention")
+    except Exception:
+        if not _torch_available():
+            raise ImportError(
+                f"Could not load {path} as a NumPy policy and PyTorch is unavailable."
+            )
+        return TorchTransformerPolicy.load(path)
     if policy_type == "numpy_transformer":
         return NumpyTransformerPolicy.load(path)
+    if policy_type == "torch_transformer":
+        return TorchTransformerPolicy.load(path)
     return NumpyAttentionPolicy.load(path)
 
 
 def policy_from_model(
-    model: NumpyAttentionPolicy | NumpyTransformerPolicy,
+    model: NumpyAttentionPolicy | NumpyTransformerPolicy | TorchTransformerPolicy,
     max_neighbors: int,
     sim_config: SimConfig,
     obstacle_map: GridMap | None = None,

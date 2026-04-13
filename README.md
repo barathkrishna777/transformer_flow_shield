@@ -11,7 +11,7 @@ This workspace implements phase 0 through phase 4 from `research_plan.md`, plus 
 - Phase 6 foundation: a dependency-free `prioritized_astar` reservation-table waypoint expert for obstacle maps, alongside the default `independent_astar`, with expansion/fallback diagnostics. This remains experimental and is not CBS/ECBS.
 - Phase 7 foundation: a `benchmark-obstacles` planner/runner for multiple Moving AI `.map`/`.scen` entries with plan-only/dry-run mode, smoke limits, resume/skip-completed support, per-case JSON, compact JSON/CSV summaries, and failure reporting for Lambda execution.
 
-The implementation intentionally depends only on NumPy. Phase 4 detects whether PyTorch/CUDA are available and records that diagnostic in results, but the current scalable path uses a NumPy transformer-style fixed attention encoder with a closed-form ridge-regression output head. New transformer runs also append raw self-token features to that output head so path-aware Phase 3 features are not lost behind the random encoder. This is a prototype scaling path, not a full PyTorch transformer trainer.
+The base implementation intentionally depends only on NumPy, but a real trainable PyTorch transformer planner is available when PyTorch is installed and `--policy-type torch_transformer` is selected. The older NumPy transformer path remains the default for CPU smoke compatibility; it uses fixed random attention features plus a ridge-regression output head and should be treated as a prototype baseline.
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -82,6 +82,31 @@ python3 -m flow_shield.cli phase3 \
   --horizon 5 \
   --max-steps 8 \
   --expert-type prioritized_astar
+```
+
+Train the actual PyTorch transformer planner on Lambda/GPU by selecting `torch_transformer`:
+
+```bash
+python3 -m flow_shield.cli phase3 \
+  --map tests/fixtures/tiny_obstacle.map \
+  --output-dir runs/phase3_torch_transformer \
+  --num-agents 8 \
+  --train-scenarios 64 \
+  --eval-scenarios 16 \
+  --horizon 120 \
+  --max-steps 240 \
+  --max-samples 50000 \
+  --policy-type torch_transformer \
+  --d-model 128 \
+  --num-heads 4 \
+  --num-layers 3 \
+  --batch-size 512 \
+  --epochs 50 \
+  --learning-rate 0.0005 \
+  --weight-decay 0.0001 \
+  --dropout 0.05 \
+  --torch-device auto \
+  --variants none pairwise
 ```
 
 Add Phase 5 auxiliary correction targets to a dataset when you want shield-correction supervision artifacts for later co-design work:
@@ -157,6 +182,34 @@ python3 -m flow_shield.cli benchmark-obstacles \
 ```
 
 Map lists may contain either one map path per line or `map scen` pairs. On Lambda, use the same command without `--plan-only` and with larger limits. Keep full benchmark runs off laptops: point `--map-scen-list` at a text or JSON list of Moving AI pairs, write to a mounted output directory, and collect `benchmark_plan.json`, `benchmark_summary.json`, `benchmark_compact_summary.json`, `benchmark_compact_summary.csv`, and each case's `phase3_results.json`.
+
+Use the same benchmark runner with the real transformer backend:
+
+```bash
+python3 -m flow_shield.cli benchmark-obstacles \
+  --map-scen-list /tmp/map_scen_obstacles.txt \
+  --output-dir runs/obstacle_medium_torch_transformer \
+  --agent-counts 4,8 \
+  --seeds 7007,7008,7009 \
+  --train-scenarios 64 \
+  --eval-scenarios 8 \
+  --horizon 120 \
+  --max-steps 240 \
+  --max-samples 50000 \
+  --limit 24 \
+  --case-timeout-seconds 1200 \
+  --expert-type independent_astar \
+  --policy-type torch_transformer \
+  --d-model 128 \
+  --num-heads 4 \
+  --num-layers 3 \
+  --batch-size 512 \
+  --epochs 50 \
+  --learning-rate 0.0005 \
+  --weight-decay 0.0001 \
+  --dropout 0.05 \
+  --torch-device auto
+```
 
 Resume a partially completed benchmark directory:
 
@@ -286,7 +339,7 @@ Prototype notes:
 
 - `velocity_clip` is explicit and measurable, but the simulator also clips commands to `max_speed` during stepping.
 - `pibt` is a one-step continuous priority inheritance/backtracking prototype. It is diagnostic, not a liveness proof; unresolved conflicts remain visible in `final_conflicts`, `collision_rate`, and separation-violation metrics.
-- Phase 4's NumPy transformer policy trains only the output head over fixed random attention plus raw self-token features. Results include `backend_diagnostics` and notes documenting this fallback.
+- Phase 4's default NumPy transformer policy trains only the output head over fixed random attention plus raw self-token features. Select `--policy-type torch_transformer` to train all transformer weights with AdamW in PyTorch. Results include `backend_diagnostics` and notes documenting the selected backend.
 - Phase 3 obstacle experts are per-agent A* waypoint followers. They provide robust supervised velocities and an evaluation baseline for static maps, but they are not joint optimal MAPF solvers.
 - `prioritized_astar` is a simple reservation-table A* baseline that plans agents in priority order with vertex/edge reservations. It has expansion limits and reports reservation failures/fallback counts in `astar_cache_info`, but it is incomplete, slower in current probes, and can fall back to independent A* if no reserved path is found.
 - Phase 5 is foundation-only: auxiliary targets and metrics are written, but the current NumPy policies still train only velocity outputs.

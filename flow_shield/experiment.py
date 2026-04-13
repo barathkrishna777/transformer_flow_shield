@@ -55,13 +55,17 @@ def backend_diagnostics(policy_type: str) -> Dict[str, object]:
 
     diagnostics: Dict[str, object] = {
         "selected_policy_type": policy_type,
-        "selected_training_backend": "numpy",
+        "selected_training_backend": (
+            "pytorch" if policy_type.strip().lower().replace("-", "_") == "torch_transformer" else "numpy"
+        ),
         "torch_available": False,
         "cuda_available": False,
     }
     if importlib.util.find_spec("torch") is None:
         diagnostics["fallback_reason"] = (
-            "PyTorch is not installed; using the dependency-light NumPy phase 4 path."
+            "PyTorch is not installed; torch_transformer training is unavailable."
+            if diagnostics["selected_training_backend"] == "pytorch"
+            else "PyTorch is not installed; using the dependency-light NumPy phase 4 path."
         )
         return diagnostics
 
@@ -75,8 +79,9 @@ def backend_diagnostics(policy_type: str) -> Dict[str, object]:
         )
         diagnostics["torch_version"] = str(torch.__version__)
         diagnostics["fallback_reason"] = (
-            "PyTorch is installed, but this repo's phase 4 implementation currently "
-            "selects the NumPy policy backend for compatibility with existing artifacts."
+            "PyTorch transformer backend selected."
+            if diagnostics["selected_training_backend"] == "pytorch"
+            else "PyTorch is installed, but the selected policy uses the NumPy backend."
         )
     except Exception as exc:  # pragma: no cover - defensive optional dependency path.
         diagnostics["torch_import_error"] = repr(exc)

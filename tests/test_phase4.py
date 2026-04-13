@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -17,7 +18,7 @@ from flow_shield.config import (
 )
 from flow_shield.dataset import build_dataset
 from flow_shield.experiment import evaluate_phase4_ablations, train_phase4_model
-from flow_shield.model import NumpyTransformerPolicy
+from flow_shield.model import NumpyTransformerPolicy, TorchTransformerPolicy, make_policy
 from flow_shield.shield import DEFAULT_SHIELD_VARIANTS
 
 
@@ -124,6 +125,52 @@ class PhaseFourScalingTests(unittest.TestCase):
             ):
                 self.assertIn(key, metrics)
                 self.assertTrue(np.isfinite(metrics[key]))
+
+    def test_torch_transformer_policy_type_is_optional(self):
+        sim = SimConfig(world_size=(8.0, 8.0), max_steps=4)
+        model_config = ModelConfig(
+            feature_dim=10,
+            d_model=8,
+            policy_type="torch_transformer",
+            num_heads=2,
+            num_layers=1,
+            epochs=1,
+            batch_size=8,
+            torch_device="cpu",
+            seed=43,
+        )
+        if importlib.util.find_spec("torch") is None:
+            with self.assertRaises(ImportError):
+                make_policy(model_config, sim)
+            return
+
+        data = DatasetConfig(
+            num_scenarios=1,
+            num_agents=3,
+            horizon=3,
+            max_neighbors=2,
+            min_start_goal_distance=2.0,
+            seed=43,
+        )
+        dataset = build_dataset(data, sim)
+        model_config = ModelConfig(
+            feature_dim=int(dataset.observations.shape[2]),
+            d_model=8,
+            policy_type="torch_transformer",
+            num_heads=2,
+            num_layers=1,
+            epochs=1,
+            batch_size=8,
+            learning_rate=1e-3,
+            torch_device="cpu",
+            seed=43,
+        )
+        model, history = train_phase4_model(dataset, sim, model_config)
+        self.assertIsInstance(model, TorchTransformerPolicy)
+        self.assertEqual(history["fit_method"], "torch_transformer_adamw")
+        predictions = model.predict_batch(dataset.observations[:2], dataset.masks[:2])
+        self.assertEqual(predictions.shape, (2, 2))
+        self.assertTrue(np.all(np.isfinite(predictions)))
 
     def test_phase4_cli_smoke_writes_artifacts(self):
         with tempfile.TemporaryDirectory() as tmpdir:

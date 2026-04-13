@@ -33,6 +33,17 @@ class BenchmarkCase:
     obstacle_context_range: float
     observation_version: str
     expert_type: str
+    policy_type: str
+    d_model: int
+    num_heads: int
+    num_layers: int
+    batch_size: int
+    epochs: int
+    learning_rate: float
+    weight_decay: float
+    dropout: float
+    grad_clip_norm: float
+    torch_device: str
 
 
 def _read_map_scen_list(path: str | Path) -> List[Dict[str, Optional[str]]]:
@@ -283,6 +294,17 @@ def build_benchmark_plan(
     obstacle_context_range: float,
     observation_version: str,
     expert_type: str,
+    policy_type: str = "numpy_transformer",
+    d_model: int = 16,
+    num_heads: int = 2,
+    num_layers: int = 1,
+    batch_size: int = 64,
+    epochs: int = 40,
+    learning_rate: float = 2e-3,
+    weight_decay: float = 1e-5,
+    dropout: float = 0.0,
+    grad_clip_norm: float = 1.0,
+    torch_device: str = "auto",
     limit: Optional[int] = None,
     smoke: bool = False,
 ) -> Dict[str, object]:
@@ -311,6 +333,17 @@ def build_benchmark_plan(
                     obstacle_context_range=float(obstacle_context_range),
                     observation_version=str(observation_version),
                     expert_type=str(expert_type),
+                    policy_type=str(policy_type),
+                    d_model=int(d_model),
+                    num_heads=int(num_heads),
+                    num_layers=int(num_layers),
+                    batch_size=int(batch_size),
+                    epochs=1 if smoke else int(epochs),
+                    learning_rate=float(learning_rate),
+                    weight_decay=float(weight_decay),
+                    dropout=float(dropout),
+                    grad_clip_norm=float(grad_clip_norm),
+                    torch_device=str(torch_device),
                 )
                 cases.append(case)
                 if limit is not None and len(cases) >= int(limit):
@@ -486,8 +519,9 @@ def run_benchmark_plan(
                         "map": _map_name(case.get("map_path")),
                         "num_agents": case.get("num_agents"),
                         "seed": case.get("seed"),
-                        "expert_type": case.get("expert_type"),
-                        "shield_variants": sorted(existing.get("metrics", {}).keys()),
+                    "expert_type": case.get("expert_type"),
+                    "policy_type": case.get("policy_type"),
+                    "shield_variants": sorted(existing.get("metrics", {}).keys()),
                     },
                 }
                 results.append(case_result)
@@ -554,11 +588,17 @@ def run_benchmark_plan(
                 max_samples=case.get("max_samples"),
             )
             model_config = ModelConfig(
-                d_model=16,
-                policy_type="numpy_transformer",
-                num_heads=2,
-                num_layers=1,
-                batch_size=64,
+                d_model=int(case.get("d_model", 16)),
+                policy_type=str(case.get("policy_type", "numpy_transformer")),
+                num_heads=int(case.get("num_heads", 2)),
+                num_layers=int(case.get("num_layers", 1)),
+                batch_size=int(case.get("batch_size", 64)),
+                epochs=int(case.get("epochs", 40)),
+                learning_rate=float(case.get("learning_rate", 2e-3)),
+                weight_decay=float(case.get("weight_decay", 1e-5)),
+                dropout=float(case.get("dropout", 0.0)),
+                grad_clip_norm=float(case.get("grad_clip_norm", 1.0)),
+                torch_device=str(case.get("torch_device", "auto")),
                 seed=int(case["seed"]) + 17,
             )
             with _case_timeout(case_timeout_seconds):
@@ -589,6 +629,7 @@ def run_benchmark_plan(
                     "num_agents": case.get("num_agents"),
                     "seed": case.get("seed"),
                     "expert_type": case.get("expert_type"),
+                    "policy_type": case.get("policy_type"),
                     "shield_variants": sorted(result.get("metrics", {}).keys()),
                 },
             }

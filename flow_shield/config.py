@@ -66,6 +66,9 @@ class ModelConfig:
     weight_decay: float = 1e-5
     validation_split: float = 0.1
     ridge_lambda: float = 1e-3
+    dropout: float = 0.0
+    grad_clip_norm: float = 1.0
+    torch_device: str = "auto"
     seed: int = 11
 
     def to_dict(self) -> Dict[str, Any]:

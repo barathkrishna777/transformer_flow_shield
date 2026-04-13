@@ -514,6 +514,17 @@ class PhaseThreeObstacleMapTests(unittest.TestCase):
                 obstacle_context_range=4.0,
                 observation_version="obstacle_waypoint_v2",
                 expert_type="prioritized_astar",
+                policy_type="torch_transformer",
+                d_model=32,
+                num_heads=4,
+                num_layers=2,
+                batch_size=128,
+                epochs=3,
+                learning_rate=1e-3,
+                weight_decay=1e-4,
+                dropout=0.1,
+                grad_clip_norm=0.5,
+                torch_device="cpu",
                 limit=1,
                 smoke=True,
             )
@@ -531,6 +542,9 @@ class PhaseThreeObstacleMapTests(unittest.TestCase):
             written = json.loads((output_dir / "benchmark_plan.json").read_text(encoding="utf-8"))
             self.assertEqual(written["case_count"], 1)
             self.assertEqual(written["cases"][0]["expert_type"], "prioritized_astar")
+            self.assertEqual(written["cases"][0]["policy_type"], "torch_transformer")
+            self.assertEqual(written["cases"][0]["d_model"], 32)
+            self.assertEqual(written["cases"][0]["epochs"], 1)
             self.assertIsNone(written["cases"][0]["scen_path"])
             status = json.loads((output_dir / "benchmark_status.json").read_text(encoding="utf-8"))
             self.assertEqual(status["state"], "plan_only")

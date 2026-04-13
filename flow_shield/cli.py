@@ -145,7 +145,11 @@ def _model_config(args: argparse.Namespace) -> ModelConfig:
         epochs=getattr(args, "epochs", 40),
         batch_size=args.batch_size,
         learning_rate=getattr(args, "learning_rate", 2e-3),
+        weight_decay=getattr(args, "weight_decay", 1e-5),
         ridge_lambda=getattr(args, "ridge_lambda", 1e-3),
+        dropout=getattr(args, "dropout", 0.0),
+        grad_clip_norm=getattr(args, "grad_clip_norm", 1.0),
+        torch_device=getattr(args, "torch_device", "auto"),
         seed=args.seed + 17,
     )
 
@@ -365,12 +369,18 @@ def build_parser() -> argparse.ArgumentParser:
     phase3.add_argument("--seed", type=int, default=307)
     phase3.add_argument(
         "--policy-type",
-        choices=("numpy_transformer", "numpy_attention"),
+        choices=("numpy_transformer", "numpy_attention", "torch_transformer"),
         default="numpy_transformer",
     )
     phase3.add_argument("--d-model", type=int, default=32)
     phase3.add_argument("--num-heads", type=int, default=4)
     phase3.add_argument("--num-layers", type=int, default=1)
+    phase3.add_argument("--epochs", type=int, default=40)
+    phase3.add_argument("--learning-rate", type=float, default=2e-3)
+    phase3.add_argument("--weight-decay", type=float, default=1e-5)
+    phase3.add_argument("--dropout", type=float, default=0.0)
+    phase3.add_argument("--grad-clip-norm", type=float, default=1.0)
+    phase3.add_argument("--torch-device", choices=("auto", "cpu", "cuda"), default="auto")
     phase3.add_argument("--batch-size", type=int, default=512)
     phase3.add_argument("--ridge-lambda", type=float, default=1e-3)
     phase3.add_argument(
@@ -404,12 +414,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_map_dataset_args(phase4)
     phase4.add_argument(
         "--policy-type",
-        choices=("numpy_transformer", "numpy_attention"),
+        choices=("numpy_transformer", "numpy_attention", "torch_transformer"),
         default="numpy_transformer",
     )
     phase4.add_argument("--d-model", type=int, default=64)
     phase4.add_argument("--num-heads", type=int, default=4)
     phase4.add_argument("--num-layers", type=int, default=2)
+    phase4.add_argument("--epochs", type=int, default=40)
+    phase4.add_argument("--learning-rate", type=float, default=2e-3)
+    phase4.add_argument("--weight-decay", type=float, default=1e-5)
+    phase4.add_argument("--dropout", type=float, default=0.0)
+    phase4.add_argument("--grad-clip-norm", type=float, default=1.0)
+    phase4.add_argument("--torch-device", choices=("auto", "cpu", "cuda"), default="auto")
     phase4.add_argument("--batch-size", type=int, default=2048)
     phase4.add_argument("--ridge-lambda", type=float, default=1e-3)
     phase4.add_argument(
@@ -477,6 +493,21 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("independent_astar", "prioritized_astar"),
         default="independent_astar",
     )
+    benchmark.add_argument(
+        "--policy-type",
+        choices=("numpy_transformer", "numpy_attention", "torch_transformer"),
+        default="numpy_transformer",
+    )
+    benchmark.add_argument("--d-model", type=int, default=16)
+    benchmark.add_argument("--num-heads", type=int, default=2)
+    benchmark.add_argument("--num-layers", type=int, default=1)
+    benchmark.add_argument("--batch-size", type=int, default=64)
+    benchmark.add_argument("--epochs", type=int, default=40)
+    benchmark.add_argument("--learning-rate", type=float, default=2e-3)
+    benchmark.add_argument("--weight-decay", type=float, default=1e-5)
+    benchmark.add_argument("--dropout", type=float, default=0.0)
+    benchmark.add_argument("--grad-clip-norm", type=float, default=1.0)
+    benchmark.add_argument("--torch-device", choices=("auto", "cpu", "cuda"), default="auto")
     benchmark.add_argument("--limit", type=int, default=None)
     benchmark.add_argument("--smoke", action="store_true")
     benchmark.add_argument(
@@ -637,6 +668,17 @@ def main() -> None:
             obstacle_context_range=args.obstacle_context_range,
             observation_version=args.observation_version,
             expert_type=args.expert_type,
+            policy_type=args.policy_type,
+            d_model=args.d_model,
+            num_heads=args.num_heads,
+            num_layers=args.num_layers,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            dropout=args.dropout,
+            grad_clip_norm=args.grad_clip_norm,
+            torch_device=args.torch_device,
             limit=args.limit,
             smoke=args.smoke,
         )

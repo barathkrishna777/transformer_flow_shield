@@ -12,7 +12,9 @@ from flow_shield.config import DatasetConfig, ModelConfig, SimConfig
 from flow_shield.benchmark import build_benchmark_plan, run_benchmark_plan
 from flow_shield.dataset import build_dataset, load_dataset
 from flow_shield.expert import (
+    astar_cache_info,
     astar_grid_path,
+    clear_astar_caches,
     generate_scenarios,
     obstacle_map_velocity,
     prioritized_obstacle_map_velocity,
@@ -85,12 +87,16 @@ class PhaseThreeObstacleMapTests(unittest.TestCase):
         self.assertEqual(record["obstacle_motion_hits"], (0,))
 
     def test_obstacle_aware_expert_waypoint_velocity(self):
+        clear_astar_caches()
         grid = load_moving_ai_map(FIXTURE_MAP)
         sim = SimConfig(world_size=grid.world_size, agent_radius=0.18, max_speed=1.0)
         start = np.array([[0.5, 2.5]], dtype=np.float64)
         goal = np.array([[5.5, 2.5]], dtype=np.float64)
         path = astar_grid_path(grid, start[0], goal[0], sim.agent_radius, sim.safety_margin)
         self.assertIsNotNone(path)
+        path_again = astar_grid_path(grid, start[0], goal[0], sim.agent_radius, sim.safety_margin)
+        self.assertEqual(path_again, path)
+        self.assertGreaterEqual(astar_cache_info()["astar_path_hits"], 1)
         velocity = obstacle_map_velocity(start, goal, sim, grid)
         self.assertEqual(velocity.shape, (1, 2))
         self.assertGreater(np.linalg.norm(velocity[0]), 0.0)

@@ -13,6 +13,7 @@ import numpy as np
 from .config import DatasetConfig, ModelConfig, SimConfig
 from .dataset import TrajectoryDataset, build_dataset, scenario_to_jsonable
 from .expert import (
+    astar_cache_info,
     generate_scenarios,
     normalize_expert_type,
     obstacle_map_expert_velocity,
@@ -756,6 +757,7 @@ def run_phase3_experiment(
             "observation_metadata": dataset.dataset_config.get("observation_metadata"),
             "auxiliary_target_metadata": dataset.dataset_config.get("auxiliary_target_metadata"),
             "expert_type": dataset_config.expert_type,
+            "astar_cache_info": astar_cache_info(),
             "notes": _phase3_notes(),
         },
     )
@@ -797,6 +799,7 @@ def run_phase3_experiment(
         "expert_waypoint_baseline": ablations.get("expert_waypoint_baseline", {}),
         "learned_vs_expert": ablations.get("learned_vs_expert", {}),
         "backend_diagnostics": diagnostics,
+        "astar_cache_info": astar_cache_info(),
         "notes": _phase3_notes(),
         "sim_config": sim_config.to_dict(),
         "dataset_config": dataset_config.to_dict(),
@@ -908,6 +911,7 @@ def run_phase4_experiment(
             "observation_metadata": dataset.dataset_config.get("observation_metadata"),
             "auxiliary_target_metadata": dataset.dataset_config.get("auxiliary_target_metadata"),
             "expert_type": dataset_config.expert_type,
+            "astar_cache_info": astar_cache_info(),
             "notes": _phase4_notes(dataset_config),
         },
     )
@@ -948,6 +952,7 @@ def run_phase4_experiment(
         "expert_waypoint_baseline": ablations.get("expert_waypoint_baseline", {}),
         "learned_vs_expert": ablations.get("learned_vs_expert", {}),
         "backend_diagnostics": diagnostics,
+        "astar_cache_info": astar_cache_info(),
         "notes": _phase4_notes(dataset_config),
         "sim_config": sim_config.to_dict(),
         "dataset_config": dataset_config.to_dict(),

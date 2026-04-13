@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import heapq
-from collections import Counter
-from typing import Dict, List, Optional, Tuple
+from collections import Counter, OrderedDict
+from typing import Dict, Hashable, List, Optional, Tuple
 
 import numpy as np
 
@@ -66,6 +66,11 @@ _NEIGHBOR_DELTAS = (
     (1, 1, np.sqrt(2.0)),
 )
 _WAIT_DELTA = (0, 0, 1.0)
+_CELL_CLEARANCE_CACHE_MAX = 250_000
+_ASTAR_PATH_CACHE_MAX = 100_000
+_CELL_CLEARANCE_CACHE: "OrderedDict[Tuple[Hashable, ...], bool]" = OrderedDict()
+_ASTAR_PATH_CACHE: "OrderedDict[Tuple[Hashable, ...], Optional[Tuple[Tuple[int, int], ...]]]" = OrderedDict()
+_ASTAR_CACHE_STATS = Counter()
 
 
 def normalize_expert_type(expert_type: str | None) -> str:
@@ -88,6 +93,58 @@ def normalize_expert_type(expert_type: str | None) -> str:
     return aliases[normalized]
 
 
+def _rounded_float(value: float) -> float:
+    return round(float(value), 6)
+
+
+def _map_cache_key(obstacle_map: GridMap) -> Tuple[Hashable, ...]:
+    return (
+        id(obstacle_map),
+        obstacle_map.source_path,
+        obstacle_map.name,
+        int(obstacle_map.width),
+        int(obstacle_map.height),
+        _rounded_float(obstacle_map.cell_size),
+        int(obstacle_map.blocked_count),
+    )
+
+
+def _cache_get(cache: OrderedDict, key: Tuple[Hashable, ...]):
+    try:
+        value = cache.pop(key)
+    except KeyError:
+        return None, False
+    cache[key] = value
+    return value, True
+
+
+def _cache_put(cache: OrderedDict, key: Tuple[Hashable, ...], value, max_size: int) -> None:
+    cache[key] = value
+    if len(cache) > max_size:
+        cache.popitem(last=False)
+
+
+def clear_astar_caches() -> None:
+    """Clear bounded A* and clearance caches, mainly for tests/benchmark hygiene."""
+
+    _CELL_CLEARANCE_CACHE.clear()
+    _ASTAR_PATH_CACHE.clear()
+    _ASTAR_CACHE_STATS.clear()
+
+
+def astar_cache_info() -> Dict[str, int]:
+    """Return lightweight cache diagnostics for benchmark metadata/debugging."""
+
+    return {
+        "cell_clearance_entries": len(_CELL_CLEARANCE_CACHE),
+        "astar_path_entries": len(_ASTAR_PATH_CACHE),
+        "cell_clearance_hits": int(_ASTAR_CACHE_STATS["cell_clearance_hits"]),
+        "cell_clearance_misses": int(_ASTAR_CACHE_STATS["cell_clearance_misses"]),
+        "astar_path_hits": int(_ASTAR_CACHE_STATS["astar_path_hits"]),
+        "astar_path_misses": int(_ASTAR_CACHE_STATS["astar_path_misses"]),
+    }
+
+
 def _cell_has_clearance(
     obstacle_map: GridMap,
     row: int,
@@ -97,11 +154,25 @@ def _cell_has_clearance(
 ) -> bool:
     if not obstacle_map.is_cell_free(row, col):
         return False
-    return not obstacle_map.circle_collides(
+    key = (
+        *_map_cache_key(obstacle_map),
+        int(row),
+        int(col),
+        _rounded_float(radius),
+        _rounded_float(margin),
+    )
+    cached, hit = _cache_get(_CELL_CLEARANCE_CACHE, key)
+    if hit:
+        _ASTAR_CACHE_STATS["cell_clearance_hits"] += 1
+        return bool(cached)
+    _ASTAR_CACHE_STATS["cell_clearance_misses"] += 1
+    value = not obstacle_map.circle_collides(
         obstacle_map.cell_center(row, col),
         radius,
         margin=margin,
     )
+    _cache_put(_CELL_CLEARANCE_CACHE, key, bool(value), _CELL_CLEARANCE_CACHE_MAX)
+    return bool(value)
 
 
 def _nearest_clear_cell(
@@ -152,8 +223,22 @@ def astar_grid_path(
     goal_cell = _nearest_clear_cell(obstacle_map, goal, radius, margin)
     if start_cell is None or goal_cell is None:
         return None
+    cache_key = (
+        *_map_cache_key(obstacle_map),
+        start_cell,
+        goal_cell,
+        _rounded_float(radius),
+        _rounded_float(margin),
+    )
+    cached, hit = _cache_get(_ASTAR_PATH_CACHE, cache_key)
+    if hit:
+        _ASTAR_CACHE_STATS["astar_path_hits"] += 1
+        return list(cached) if cached is not None else None
+    _ASTAR_CACHE_STATS["astar_path_misses"] += 1
     if start_cell == goal_cell:
-        return [start_cell]
+        path = (start_cell,)
+        _cache_put(_ASTAR_PATH_CACHE, cache_key, path, _ASTAR_PATH_CACHE_MAX)
+        return list(path)
 
     open_heap: List[Tuple[float, float, Tuple[int, int]]] = []
     heapq.heappush(open_heap, (_octile_heuristic(start_cell, goal_cell), 0.0, start_cell))
@@ -170,7 +255,9 @@ def astar_grid_path(
             while cell in came_from:
                 cell = came_from[cell]
                 path.append(cell)
-            return list(reversed(path))
+            result = tuple(reversed(path))
+            _cache_put(_ASTAR_PATH_CACHE, cache_key, result, _ASTAR_PATH_CACHE_MAX)
+            return list(result)
         closed.add(cell)
         row, col = cell
         for dr, dc, step_cost in _NEIGHBOR_DELTAS:
@@ -196,6 +283,7 @@ def astar_grid_path(
             came_from[next_cell] = cell
             priority = new_cost + _octile_heuristic(next_cell, goal_cell)
             heapq.heappush(open_heap, (priority, new_cost, next_cell))
+    _cache_put(_ASTAR_PATH_CACHE, cache_key, None, _ASTAR_PATH_CACHE_MAX)
     return None
 
 

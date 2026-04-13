@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import signal
+import csv
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -69,6 +70,201 @@ def _read_map_scen_list(path: str | Path) -> List[Dict[str, Optional[str]]]:
             }
         )
     return entries
+
+
+def _map_name(path: object) -> str:
+    return Path(str(path)).stem if path else ""
+
+
+def _compact_metric_row(
+    case: Dict[str, object],
+    variant: str,
+    metrics: Dict[str, object],
+    result_path: Optional[str] = None,
+    elapsed_seconds: Optional[float] = None,
+    resumed: bool = False,
+) -> Dict[str, object]:
+    row: Dict[str, object] = {
+        "case_id": case.get("case_id"),
+        "map": _map_name(case.get("map_path")),
+        "map_path": case.get("map_path"),
+        "scen_path": case.get("scen_path"),
+        "num_agents": case.get("num_agents"),
+        "seed": case.get("seed"),
+        "expert_type": case.get("expert_type"),
+        "shield_variant": variant,
+        "result_path": result_path,
+        "elapsed_seconds": elapsed_seconds,
+        "resumed": bool(resumed),
+    }
+    for key in (
+        "success_rate",
+        "deadlock_rate",
+        "no_progress_rate",
+        "collision_rate",
+        "pair_collisions_per_run",
+        "obstacle_collision_rate",
+        "obstacle_collisions_per_run",
+        "mean_time_to_goal",
+        "mean_final_distance_to_goal",
+        "max_final_distance_to_goal",
+        "mean_fraction_agents_within_goal_tolerance",
+        "correction_needed_rate",
+        "obstacle_intervention_rate",
+        "pairwise_intervention_rate",
+        "steps_per_second",
+        "agents_per_second",
+    ):
+        row[key] = metrics.get(key, 0.0)
+    breakdown = metrics.get("failure_breakdown", {})
+    if isinstance(breakdown, dict):
+        for key, value in breakdown.items():
+            row[f"failure_{key}"] = value
+    return row
+
+
+def compact_case_rows(
+    case: Dict[str, object],
+    metrics_by_variant: Dict[str, Dict[str, object]],
+    result_path: Optional[str] = None,
+    elapsed_seconds: Optional[float] = None,
+    resumed: bool = False,
+) -> List[Dict[str, object]]:
+    return [
+        _compact_metric_row(
+            case,
+            variant,
+            metrics,
+            result_path=result_path,
+            elapsed_seconds=elapsed_seconds,
+            resumed=resumed,
+        )
+        for variant, metrics in sorted(metrics_by_variant.items())
+    ]
+
+
+def _mean(values: List[float]) -> float:
+    return float(sum(values) / max(len(values), 1))
+
+
+def grouped_compact_summary(rows: Iterable[Dict[str, object]]) -> Dict[str, List[Dict[str, object]]]:
+    numeric_keys = (
+        "success_rate",
+        "deadlock_rate",
+        "no_progress_rate",
+        "collision_rate",
+        "obstacle_collision_rate",
+        "mean_time_to_goal",
+        "mean_final_distance_to_goal",
+        "mean_fraction_agents_within_goal_tolerance",
+        "correction_needed_rate",
+        "obstacle_intervention_rate",
+        "pairwise_intervention_rate",
+    )
+    groups: Dict[tuple, List[Dict[str, object]]] = {}
+    for row in rows:
+        key = (row.get("map"), row.get("num_agents"), row.get("shield_variant"))
+        groups.setdefault(key, []).append(row)
+    grouped = []
+    for (map_name, num_agents, variant), group_rows in sorted(groups.items()):
+        item: Dict[str, object] = {
+            "map": map_name,
+            "num_agents": num_agents,
+            "shield_variant": variant,
+            "case_count": len(group_rows),
+        }
+        for key in numeric_keys:
+            item[key] = _mean([float(row.get(key, 0.0)) for row in group_rows])
+        grouped.append(item)
+    return {"by_map_agent_count_shield": grouped}
+
+
+def write_compact_outputs(rows: List[Dict[str, object]], output_dir: str | Path) -> Dict[str, str]:
+    output_dir = Path(output_dir)
+    compact_path = output_dir / "benchmark_compact_summary.json"
+    csv_path = output_dir / "benchmark_compact_summary.csv"
+    payload = {
+        "rows": rows,
+        "groups": grouped_compact_summary(rows),
+    }
+    compact_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    fieldnames = sorted({key for row in rows for key in row.keys()})
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return {"compact_json": str(compact_path), "compact_csv": str(csv_path)}
+
+
+def compare_benchmark_summaries(
+    left_dir: str | Path,
+    right_dir: str | Path,
+    output_path: Optional[str | Path] = None,
+) -> Dict[str, object]:
+    """Compare two compact benchmark summaries by map/agent/expert/shield keys."""
+
+    def _load_rows(directory: str | Path) -> List[Dict[str, object]]:
+        path = Path(directory) / "benchmark_compact_summary.json"
+        if not path.exists():
+            summary_path = Path(directory) / "benchmark_summary.json"
+            if not summary_path.exists():
+                raise FileNotFoundError(f"Missing compact or aggregate summary in {directory}")
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            rows: List[Dict[str, object]] = []
+            for result in summary.get("results", []):
+                rows.extend(
+                    compact_case_rows(
+                        result,
+                        result.get("metrics", {}),
+                        result_path=result.get("result_path"),
+                        elapsed_seconds=result.get("elapsed_seconds"),
+                        resumed=bool(result.get("resumed", False)),
+                    )
+                )
+            return rows
+        return list(json.loads(path.read_text(encoding="utf-8")).get("rows", []))
+
+    left_rows = _load_rows(left_dir)
+    right_rows = _load_rows(right_dir)
+    key_fields = ("map", "num_agents", "seed", "expert_type", "shield_variant")
+    left_by_key = {tuple(row.get(field) for field in key_fields): row for row in left_rows}
+    right_by_key = {tuple(row.get(field) for field in key_fields): row for row in right_rows}
+    metric_keys = (
+        "success_rate",
+        "deadlock_rate",
+        "no_progress_rate",
+        "mean_time_to_goal",
+        "mean_final_distance_to_goal",
+        "obstacle_collision_rate",
+        "pairwise_intervention_rate",
+        "obstacle_intervention_rate",
+    )
+    comparisons = []
+    for key in sorted(set(left_by_key) & set(right_by_key)):
+        left = left_by_key[key]
+        right = right_by_key[key]
+        row = {field: value for field, value in zip(key_fields, key)}
+        for metric in metric_keys:
+            row[f"{metric}_left"] = left.get(metric, 0.0)
+            row[f"{metric}_right"] = right.get(metric, 0.0)
+            row[f"{metric}_delta_right_minus_left"] = float(right.get(metric, 0.0)) - float(
+                left.get(metric, 0.0)
+            )
+        comparisons.append(row)
+    result = {
+        "left_dir": str(left_dir),
+        "right_dir": str(right_dir),
+        "matched_rows": len(comparisons),
+        "left_only_rows": len(set(left_by_key) - set(right_by_key)),
+        "right_only_rows": len(set(right_by_key) - set(left_by_key)),
+        "comparisons": comparisons,
+    }
+    if output_path is not None:
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        result["output_path"] = str(output)
+    return result
 
 
 def build_benchmark_plan(
@@ -192,6 +388,7 @@ def run_benchmark_plan(
     plan_only: bool = False,
     echo_progress: bool = True,
     case_timeout_seconds: Optional[float] = None,
+    skip_completed: bool = False,
 ) -> Dict[str, object]:
     """Execute a benchmark plan case-by-case or just write the plan."""
 
@@ -221,6 +418,7 @@ def run_benchmark_plan(
             "skipped": [],
             "progress_path": str(progress_path),
             "status_path": str(status_path),
+            "compact_rows": [],
         }
         summary_path = output_dir / "benchmark_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -237,10 +435,12 @@ def run_benchmark_plan(
     results = []
     failed = []
     skipped = []
+    compact_rows: List[Dict[str, object]] = []
     cases = list(plan.get("cases", []))
     total_start = perf_counter()
     for index, case in enumerate(cases):
         case_output = output_dir / str(case["case_id"])
+        per_map_path = case_output / "phase3_results.json"
         case_start = perf_counter()
         case_status = {
             "state": "running",
@@ -255,6 +455,7 @@ def run_benchmark_plan(
             "completed_count": len(results),
             "failed_count": len(failed),
             "timeout_seconds": case_timeout_seconds,
+            "skip_completed": bool(skip_completed),
         }
         _write_status(status_path, case_status)
         _append_progress(
@@ -265,6 +466,72 @@ def run_benchmark_plan(
             },
             echo=echo_progress,
         )
+        if skip_completed and per_map_path.exists():
+            try:
+                existing = json.loads(per_map_path.read_text(encoding="utf-8"))
+                elapsed = float(perf_counter() - case_start)
+                case_result = {
+                    "case_id": case["case_id"],
+                    "map_path": case.get("map_path"),
+                    "scen_path": case.get("scen_path"),
+                    "num_agents": case.get("num_agents"),
+                    "seed": case.get("seed"),
+                    "expert_type": case.get("expert_type"),
+                    "result_path": str(per_map_path),
+                    "success": True,
+                    "resumed": True,
+                    "elapsed_seconds": elapsed,
+                    "metrics": existing.get("metrics", {}),
+                    "case_summary": {
+                        "map": _map_name(case.get("map_path")),
+                        "num_agents": case.get("num_agents"),
+                        "seed": case.get("seed"),
+                        "expert_type": case.get("expert_type"),
+                        "shield_variants": sorted(existing.get("metrics", {}).keys()),
+                    },
+                }
+                results.append(case_result)
+                compact_rows.extend(
+                    compact_case_rows(
+                        dict(case),
+                        existing.get("metrics", {}),
+                        result_path=str(per_map_path),
+                        elapsed_seconds=elapsed,
+                        resumed=True,
+                    )
+                )
+                skip_record = {
+                    "case_id": case.get("case_id"),
+                    "map_path": case.get("map_path"),
+                    "scen_path": case.get("scen_path"),
+                    "reason": "completed_existing",
+                    "result_path": str(per_map_path),
+                }
+                skipped.append(skip_record)
+                _append_progress(
+                    progress_path,
+                    {
+                        "event": "case_skipped_existing",
+                        **skip_record,
+                        "completed_count": len(results),
+                        "failed_count": len(failed),
+                        "skipped_count": len(skipped),
+                    },
+                    echo=echo_progress,
+                )
+                continue
+            except Exception as exc:  # pragma: no cover - corrupt resume artifact path.
+                _append_progress(
+                    progress_path,
+                    {
+                        "event": "case_resume_read_failed",
+                        "case_id": case.get("case_id"),
+                        "result_path": str(per_map_path),
+                        "reason": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                    echo=echo_progress,
+                )
         try:
             sim_config = SimConfig(
                 max_steps=int(case["max_steps"]),
@@ -305,15 +572,36 @@ def run_benchmark_plan(
                     variants=("none", "pairwise"),
                     max_iterations=3,
                 )
-            per_map_path = case_output / "phase3_results.json"
             case_result = {
                 "case_id": case["case_id"],
+                "map_path": case.get("map_path"),
+                "scen_path": case.get("scen_path"),
+                "num_agents": case.get("num_agents"),
+                "seed": case.get("seed"),
+                "expert_type": case.get("expert_type"),
                 "result_path": str(per_map_path),
                 "success": True,
+                "resumed": False,
                 "elapsed_seconds": float(perf_counter() - case_start),
                 "metrics": result.get("metrics", {}),
+                "case_summary": {
+                    "map": _map_name(case.get("map_path")),
+                    "num_agents": case.get("num_agents"),
+                    "seed": case.get("seed"),
+                    "expert_type": case.get("expert_type"),
+                    "shield_variants": sorted(result.get("metrics", {}).keys()),
+                },
             }
             results.append(case_result)
+            compact_rows.extend(
+                compact_case_rows(
+                    dict(case),
+                    result.get("metrics", {}),
+                    result_path=str(per_map_path),
+                    elapsed_seconds=case_result["elapsed_seconds"],
+                    resumed=False,
+                )
+            )
             _append_progress(
                 progress_path,
                 {
@@ -357,10 +645,13 @@ def run_benchmark_plan(
         "elapsed_seconds": float(perf_counter() - total_start),
         "progress_path": str(progress_path),
         "status_path": str(status_path),
+        "compact_rows": compact_rows,
+        "grouped_summary": grouped_compact_summary(compact_rows),
         "results": results,
         "failed": failed,
         "skipped": skipped,
     }
+    summary.update(write_compact_outputs(compact_rows, output_dir))
     summary_path = output_dir / "benchmark_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     _write_status(

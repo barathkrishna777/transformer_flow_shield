@@ -198,6 +198,7 @@ def rollout(
     first_success_step = None
     steps = max_steps if max_steps is not None else config.max_steps
     start_time = perf_counter()
+    progress_window = min(20, max(2, steps // 4 if steps else 2))
 
     for _ in range(steps):
         commands = policy(world.positions, world.velocities, world.goals, world.radii)
@@ -252,6 +253,44 @@ def rollout(
             break
 
     trajectory = stack_trajectories(records)
+    final_positions = trajectory["positions"][-1] if len(records) else world.positions
+    final_distances = np.linalg.norm(world.goals - final_positions, axis=1)
+    fraction_agents_within_goal_tolerance = float(
+        np.mean(final_distances <= config.goal_tolerance)
+    )
+    if trajectory["positions"].shape[0] > progress_window:
+        recent = trajectory["positions"][-progress_window:]
+        recent_displacement = np.linalg.norm(recent[-1] - recent[0], axis=1)
+        unfinished = final_distances > config.goal_tolerance
+        no_progress_agents = recent_displacement < config.goal_tolerance * 0.25
+        no_progress_deadlock = bool(np.any(no_progress_agents & unfinished))
+        mean_recent_progress = float(np.mean(recent_displacement))
+    else:
+        no_progress_deadlock = False
+        mean_recent_progress = 0.0
+    failure_flags = {
+        "max_step_or_horizon": first_success_step is None,
+        "deadlock_no_progress": bool(no_progress_deadlock),
+        "pairwise_collision": pair_collision_count > 0,
+        "obstacle_collision": obstacle_collision_count > 0,
+        "obstacle_motion_intervention": obstacle_motion_hit_count > 0,
+        "shield_obstacle_intervention": bool(
+            np.any(shield_obstacle_interventions) if shield_obstacle_interventions else False
+        ),
+        "shield_pairwise_intervention": bool(
+            np.any(shield_pairwise_interventions) if shield_pairwise_interventions else False
+        ),
+    }
+    if first_success_step is not None:
+        termination_reason = "reached_all_goals"
+    elif no_progress_deadlock:
+        termination_reason = "deadlock_no_progress"
+    elif pair_collision_count > 0:
+        termination_reason = "pairwise_collision"
+    elif obstacle_collision_count > 0 or obstacle_motion_hit_count > 0:
+        termination_reason = "obstacle_collision_or_intervention"
+    else:
+        termination_reason = "max_step_or_horizon"
     wall_time_seconds = max(perf_counter() - start_time, 1e-12)
     agent_steps = len(records) * scenario.num_agents
     return {
@@ -262,12 +301,19 @@ def rollout(
         "obstacle_collisions": obstacle_collision_count,
         "obstacle_motion_hits": obstacle_motion_hit_count,
         "success": first_success_step is not None,
+        "termination_reason": termination_reason,
+        "failure_flags": failure_flags,
         "time_to_goal": (
             first_success_step * config.dt
             if first_success_step is not None
             else steps * config.dt
         ),
         "steps": len(records),
+        "mean_final_distance_to_goal": float(np.mean(final_distances)),
+        "max_final_distance_to_goal": float(np.max(final_distances)),
+        "fraction_agents_within_goal_tolerance": fraction_agents_within_goal_tolerance,
+        "no_progress_deadlock": bool(no_progress_deadlock),
+        "mean_recent_progress": mean_recent_progress,
         "mean_min_separation_violation": (
             float(np.mean(separation_violations)) if separation_violations else 0.0
         ),

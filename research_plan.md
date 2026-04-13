@@ -269,7 +269,8 @@ Implementation status:
   - `python3 -m flow_shield.cli phase3 --map tests/fixtures/tiny_obstacle.map --output-dir runs/phase3`
   - `python3 -m flow_shield.cli generate-data --scenario-type obstacle_map --map tests/fixtures/tiny_obstacle.map --max-obstacle-tokens 8 --output datasets/phase3_obstacle_train.npz`
 - Expected Phase 3 artifacts: `phase3_obstacle_dataset.npz`, `phase3_policy.npz`, and `phase3_results.json`.
-- Current liveness hardening: Phase 3 obstacle runs default to `obstacle_waypoint_v2`, which adds next/second A* waypoint directions, normalized remaining path length, path availability, and direct goal direction while preserving legacy loading for older 10-feature artifacts. The NumPy transformer output head can consume raw self-token features directly, so the supervised ridge head can imitate waypoint velocities instead of relying only on random encoded features. JSON includes `expert_waypoint_baseline` plus learned-vs-expert deltas for success, deadlock, time-to-goal, and safety metrics.
+- Current liveness hardening: Phase 3 obstacle runs default to `obstacle_waypoint_v2`, which adds next/second A* waypoint directions, normalized remaining path length, path availability, and direct goal direction while preserving legacy loading for older 10-feature artifacts. The NumPy transformer output head can consume raw self-token features directly, so the supervised ridge head can imitate waypoint velocities instead of relying only on random encoded features. JSON includes `expert_waypoint_baseline` plus learned-vs-expert deltas for success, deadlock, time-to-goal, final-distance, no-progress, and safety metrics.
+- Current quality diagnostics: rollout summaries now expose `termination_reason`, `failure_flags`, final distance to goal, fraction of agents within goal tolerance, and no-progress/recent-progress diagnostics. Aggregates include `failure_breakdown`, `no_progress_rate`, final-distance metrics, and within-tolerance fractions so low success can be attributed before larger sweeps.
 - Limitations: the expert is per-agent A* plus continuous waypoint following, not a joint CBS/ECBS expert; `.scen` support parses standard rows and reports skipped invalid tasks but does not yet orchestrate full benchmark suites; Phase 3 evaluates one static map at a time and surfaces unresolved obstacle/agent interactions in JSON metrics and shield diagnostics.
 
 Phase 4: Scaling Model + Data
@@ -322,7 +323,8 @@ Implementation status:
 - Phase 6 foundation implemented as a lightweight obstacle-map coordination expert: `expert_type="prioritized_astar"` uses a deterministic reservation-table A* baseline with vertex/edge reservations and wait actions.
 - The original `expert_type="independent_astar"` behavior remains the default. Expert type is stored in dataset, model, and evaluation JSON.
 - CLI support: pass `--expert-type prioritized_astar` to Phase 3/4 obstacle-map dataset runs and benchmark plans.
-- Limitation: `prioritized_astar` is a dependency-free baseline, not CBS/ECBS and not a complete joint solver. It can fall back to independent A* when a reservation-constrained path is not found.
+- Guardrails: reservation-table A* has bounded time-expanded search, reports reservation calls/failures/expansion-limit hits, and reports fallback-to-independent and total prioritized failure counts in `astar_cache_info`.
+- Limitation: `prioritized_astar` is a dependency-free baseline, not CBS/ECBS and not a complete joint solver. It can fall back to independent A* when a reservation-constrained path is not found. It remains experimental until Lambda-scale quality evidence improves.
 
 Phase 7: Stress Testing
 
@@ -335,11 +337,19 @@ Adversarial setups
 Implementation status:
 
 - Phase 7 foundation implemented as `python3 -m flow_shield.cli benchmark-obstacles`.
-- The runner accepts a text or JSON list of Moving AI `.map`/`.scen` pairs, agent counts, seeds, observation version, expert type, train/eval limits, `--smoke`, `--limit`, and `--plan-only`/`--dry-run`.
+- The runner accepts a text or JSON list of Moving AI `.map`/`.scen` pairs, including map-only lines, plus agent counts, seeds, observation version, expert type, train/eval limits, `--smoke`, `--limit`, and `--plan-only`/`--dry-run`.
 - Plan-only mode writes `benchmark_plan.json` and `benchmark_summary.json` without running training/eval, which is the recommended local validation path.
-- Execution mode writes per-case Phase 3 result JSON under the output directory and an aggregate summary with failed/skipped case reporting.
+- Execution mode writes per-case Phase 3 result JSON under the output directory, an aggregate summary with failed/skipped case reporting, compact JSON/CSV tables grouped by map, agent count, seed, expert, and shield variant, and progress/status JSONL files.
+- Usability additions: `--resume`/`--skip-completed` reuses case directories with existing `phase3_results.json`, and `benchmark-compare` compares two benchmark directories using dependency-free JSON output.
 - Lambda guidance: generate/validate a plan locally with tiny fixture data, then run the same command on Lambda without `--plan-only` and with real Moving AI lists, larger train/eval limits, and mounted output storage.
 - Limitation: this is orchestration around the current NumPy Phase 3/4 pipeline, not proof of large-scale performance. Full benchmark claims require Lambda-scale runs.
+
+Recent Lambda observations:
+
+- Cached independent 8-case obstacle run: 8/8 complete, about 116.6 seconds.
+- Cached independent medium run: 24/24 complete, about 1561 seconds using `--train-scenarios 16 --eval-scenarios 8 --horizon 80 --max-steps 160 --max-samples 10000 --limit 24 --case-timeout-seconds 600`.
+- Small cached `prioritized_astar` probe: 4/4 complete, about 147 seconds, still slower than independent on that probe and still experimental.
+- Success rates remain low, mostly 0.0 with occasional 0.125 or 0.25 cases in the medium run. Current results should be treated as infrastructure/throughput validation plus early quality diagnostics, not final planner performance.
 
 4. Additional Components
 

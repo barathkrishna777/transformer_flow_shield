@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .benchmark import build_benchmark_plan, run_benchmark_plan
+from .benchmark import build_benchmark_plan, compare_benchmark_summaries, run_benchmark_plan
 from .config import DatasetConfig, ModelConfig, SimConfig
 from .dataset import build_dataset, load_dataset
 from .experiment import (
@@ -491,6 +491,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Still write progress files, but do not echo per-case JSONL progress to stdout.",
     )
     benchmark.add_argument("--plan-only", "--dry-run", action="store_true", dest="plan_only")
+    benchmark.add_argument(
+        "--resume",
+        "--skip-completed",
+        action="store_true",
+        dest="skip_completed",
+        help="Skip case directories that already contain phase3_results.json and include them in aggregate summaries.",
+    )
+
+    compare = subparsers.add_parser(
+        "benchmark-compare",
+        help="Compare two Phase 7 benchmark output directories using compact summaries.",
+    )
+    compare.add_argument("--left", type=Path, required=True)
+    compare.add_argument("--right", type=Path, required=True)
+    compare.add_argument("--output", type=Path, default=None)
 
     return parser
 
@@ -631,8 +646,18 @@ def main() -> None:
             plan_only=args.plan_only,
             echo_progress=not args.quiet_progress,
             case_timeout_seconds=args.case_timeout_seconds,
+            skip_completed=args.skip_completed,
         )
         print(json.dumps(summary, indent=2))
+        return
+
+    if args.command == "benchmark-compare":
+        result = compare_benchmark_summaries(
+            args.left,
+            args.right,
+            output_path=args.output,
+        )
+        print(json.dumps(result, indent=2))
         return
 
 

@@ -142,6 +142,15 @@ def astar_cache_info() -> Dict[str, int]:
         "cell_clearance_misses": int(_ASTAR_CACHE_STATS["cell_clearance_misses"]),
         "astar_path_hits": int(_ASTAR_CACHE_STATS["astar_path_hits"]),
         "astar_path_misses": int(_ASTAR_CACHE_STATS["astar_path_misses"]),
+        "reservation_astar_calls": int(_ASTAR_CACHE_STATS["reservation_astar_calls"]),
+        "reservation_astar_failures": int(_ASTAR_CACHE_STATS["reservation_astar_failures"]),
+        "reservation_astar_expansion_limit_hits": int(
+            _ASTAR_CACHE_STATS["reservation_astar_expansion_limit_hits"]
+        ),
+        "prioritized_fallback_to_independent": int(
+            _ASTAR_CACHE_STATS["prioritized_fallback_to_independent"]
+        ),
+        "prioritized_total_failures": int(_ASTAR_CACHE_STATS["prioritized_total_failures"]),
     }
 
 
@@ -296,14 +305,18 @@ def _astar_grid_path_with_reservations(
     reserved_vertices: set[Tuple[int, Tuple[int, int]]],
     reserved_edges: set[Tuple[int, Tuple[int, int], Tuple[int, int]]],
     max_time: int,
+    expansion_limit: Optional[int] = None,
 ) -> Optional[List[Tuple[int, int]]]:
     """Time-expanded A* with vertex/edge reservations and wait actions."""
 
+    _ASTAR_CACHE_STATS["reservation_astar_calls"] += 1
     start_cell = _nearest_clear_cell(obstacle_map, start, radius, margin)
     goal_cell = _nearest_clear_cell(obstacle_map, goal, radius, margin)
     if start_cell is None or goal_cell is None:
+        _ASTAR_CACHE_STATS["reservation_astar_failures"] += 1
         return None
     if (0, start_cell) in reserved_vertices:
+        _ASTAR_CACHE_STATS["reservation_astar_failures"] += 1
         return None
 
     open_heap: List[Tuple[float, float, int, Tuple[int, int]]] = []
@@ -315,12 +328,20 @@ def _astar_grid_path_with_reservations(
     best_cost: Dict[Tuple[int, Tuple[int, int]], float] = {(0, start_cell): 0.0}
     closed = set()
     moves = _NEIGHBOR_DELTAS + (_WAIT_DELTA,)
+    expanded = 0
+    if expansion_limit is None:
+        expansion_limit = max(1_000, int(max_time) * int(obstacle_map.free_count + 1))
 
     while open_heap:
         _, cost, time_step, cell = heapq.heappop(open_heap)
         state = (time_step, cell)
         if state in closed:
             continue
+        expanded += 1
+        if expanded > expansion_limit:
+            _ASTAR_CACHE_STATS["reservation_astar_expansion_limit_hits"] += 1
+            _ASTAR_CACHE_STATS["reservation_astar_failures"] += 1
+            return None
         if cell == goal_cell:
             path = [cell]
             while state in came_from:
@@ -360,6 +381,7 @@ def _astar_grid_path_with_reservations(
             came_from[next_state] = state
             priority = new_cost + _octile_heuristic(next_cell, goal_cell)
             heapq.heappush(open_heap, (priority, new_cost, next_time, next_cell))
+    _ASTAR_CACHE_STATS["reservation_astar_failures"] += 1
     return None
 
 
@@ -437,6 +459,7 @@ def prioritized_obstacle_map_velocity(
         8,
         int((obstacle_map.width + obstacle_map.height) * 4 + positions.shape[0] * 2),
     )
+    expansion_limit = max(1_000, int(max_time) * int(obstacle_map.free_count + 1))
     for index in order:
         index = int(index)
         position = positions[index]
@@ -457,6 +480,7 @@ def prioritized_obstacle_map_velocity(
             reserved_vertices=reservations,
             reserved_edges=edge_reservations,
             max_time=max_time,
+            expansion_limit=expansion_limit,
         )
         if not path:
             path = astar_grid_path(
@@ -466,7 +490,10 @@ def prioritized_obstacle_map_velocity(
                 radius,
                 margin=config.safety_margin,
             )
+            if path:
+                _ASTAR_CACHE_STATS["prioritized_fallback_to_independent"] += 1
         if not path:
+            _ASTAR_CACHE_STATS["prioritized_total_failures"] += 1
             targets[index] = position
             continue
         for time_step, cell in enumerate(path):

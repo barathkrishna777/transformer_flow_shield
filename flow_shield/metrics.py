@@ -48,9 +48,14 @@ def aggregate_rollouts(rollouts: Iterable[Dict[str, object]], goals: List[np.nda
             "mean_time_to_goal": 0.0,
             "mean_smoothness": 0.0,
             "deadlock_rate": 0.0,
+            "no_progress_rate": 0.0,
+            "mean_final_distance_to_goal": 0.0,
+            "max_final_distance_to_goal": 0.0,
+            "mean_fraction_agents_within_goal_tolerance": 0.0,
             "steps_per_second": 0.0,
             "agents_per_second": 0.0,
             "mean_agents_per_run": 0.0,
+            "failure_breakdown": {},
         }
     successes = [float(result["success"]) for result in materialized]
     total_steps = sum(int(result["steps"]) for result in materialized)
@@ -125,6 +130,46 @@ def aggregate_rollouts(rollouts: Iterable[Dict[str, object]], goals: List[np.nda
                 )
             )
         )
+    final_mean_distances = [
+        float(result.get("mean_final_distance_to_goal", 0.0)) for result in materialized
+    ]
+    final_max_distances = [
+        float(result.get("max_final_distance_to_goal", 0.0)) for result in materialized
+    ]
+    within_tolerance = [
+        float(result.get("fraction_agents_within_goal_tolerance", 0.0))
+        for result in materialized
+    ]
+    no_progress = [
+        float(result.get("no_progress_deadlock", False)) for result in materialized
+    ]
+    failure_keys = (
+        "reached_all_goals",
+        "max_step_or_horizon",
+        "deadlock_no_progress",
+        "pairwise_collision",
+        "obstacle_collision",
+        "obstacle_motion_intervention",
+        "shield_obstacle_intervention",
+        "shield_pairwise_intervention",
+    )
+    failure_breakdown = {key: 0.0 for key in failure_keys}
+    for result in materialized:
+        if bool(result.get("success", False)):
+            failure_breakdown["reached_all_goals"] += 1.0
+        flags = result.get("failure_flags", {})
+        if isinstance(flags, dict):
+            for key in failure_keys:
+                if key != "reached_all_goals" and bool(flags.get(key, False)):
+                    failure_breakdown[key] += 1.0
+        else:
+            reason = str(result.get("termination_reason", "max_step_or_horizon"))
+            if reason in failure_breakdown:
+                failure_breakdown[reason] += 1.0
+    failure_breakdown = {
+        key: float(value / max(len(materialized), 1))
+        for key, value in failure_breakdown.items()
+    }
     return {
         "success_rate": float(np.mean(successes)),
         "collision_rate": float(collision_steps / max(total_steps, 1)),
@@ -145,9 +190,14 @@ def aggregate_rollouts(rollouts: Iterable[Dict[str, object]], goals: List[np.nda
         "mean_time_to_goal": float(np.mean(times)),
         "mean_smoothness": float(np.mean(smooth)),
         "deadlock_rate": float(np.mean(deadlocks)),
+        "no_progress_rate": float(np.mean(no_progress)),
+        "mean_final_distance_to_goal": float(np.mean(final_mean_distances)),
+        "max_final_distance_to_goal": float(np.max(final_max_distances)),
+        "mean_fraction_agents_within_goal_tolerance": float(np.mean(within_tolerance)),
         "steps_per_second": float(total_steps / max(total_wall_time, 1e-12)),
         "agents_per_second": float(total_agent_steps / max(total_wall_time, 1e-12)),
         "mean_agents_per_run": float(
             np.mean([float(result.get("num_agents", result["trajectory"]["positions"].shape[1])) for result in materialized])
         ),
+        "failure_breakdown": failure_breakdown,
     }

@@ -201,8 +201,17 @@ def _straight_line_policy(sim_config: SimConfig):
 def _rollout_scalar_summary(result: Dict[str, object]) -> Dict[str, object]:
     return {
         "success": bool(result["success"]),
+        "termination_reason": str(result.get("termination_reason", "")),
+        "failure_flags": dict(result.get("failure_flags", {})),
         "steps": int(result["steps"]),
         "time_to_goal": float(result["time_to_goal"]),
+        "mean_final_distance_to_goal": float(result.get("mean_final_distance_to_goal", 0.0)),
+        "max_final_distance_to_goal": float(result.get("max_final_distance_to_goal", 0.0)),
+        "fraction_agents_within_goal_tolerance": float(
+            result.get("fraction_agents_within_goal_tolerance", 0.0)
+        ),
+        "no_progress_deadlock": bool(result.get("no_progress_deadlock", False)),
+        "mean_recent_progress": float(result.get("mean_recent_progress", 0.0)),
         "collision_steps": int(result["collision_steps"]),
         "pair_collisions": int(result["pair_collisions"]),
         "obstacle_collision_steps": int(result.get("obstacle_collision_steps", 0)),

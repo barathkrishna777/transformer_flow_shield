@@ -10,6 +10,7 @@ import numpy as np
 
 from flow_shield.config import DatasetConfig, ModelConfig, SimConfig
 from flow_shield.benchmark import build_benchmark_plan, run_benchmark_plan
+from flow_shield.benchmark import compare_benchmark_summaries
 from flow_shield.dataset import build_dataset, load_dataset
 from flow_shield.expert import (
     astar_cache_info,
@@ -119,6 +120,9 @@ class PhaseThreeObstacleMapTests(unittest.TestCase):
         result = rollout(scenario, sim, policy, max_steps=sim.max_steps)
         self.assertTrue(result["success"])
         self.assertEqual(result["obstacle_collisions"], 0)
+        self.assertEqual(result["termination_reason"], "reached_all_goals")
+        self.assertIn("mean_final_distance_to_goal", result)
+        self.assertIn("fraction_agents_within_goal_tolerance", result)
 
     def test_dataset_generation_on_tiny_obstacle_map(self):
         sim = SimConfig(agent_radius=0.18, max_steps=10)
@@ -258,6 +262,7 @@ class PhaseThreeObstacleMapTests(unittest.TestCase):
         self.assertEqual(scenarios[0].starts.shape, (2, 2))
 
     def test_prioritized_astar_expert_smoke(self):
+        clear_astar_caches()
         grid = load_moving_ai_map(FIXTURE_MAP)
         sim = SimConfig(world_size=grid.world_size, agent_radius=0.18, max_speed=1.0)
         positions = np.array([[0.5, 0.5], [6.5, 6.5]], dtype=np.float64)
@@ -267,6 +272,10 @@ class PhaseThreeObstacleMapTests(unittest.TestCase):
         self.assertEqual(velocity.shape, (2, 2))
         self.assertTrue(np.all(np.isfinite(velocity)))
         self.assertTrue(np.any(np.linalg.norm(velocity, axis=1) > 0.0))
+        info = astar_cache_info()
+        self.assertGreaterEqual(info["reservation_astar_calls"], 1)
+        self.assertIn("prioritized_fallback_to_independent", info)
+        self.assertIn("prioritized_total_failures", info)
 
     def test_model_train_eval_and_shield_variants_on_obstacle_map(self):
         sim = SimConfig(agent_radius=0.18, max_steps=8)
@@ -318,6 +327,8 @@ class PhaseThreeObstacleMapTests(unittest.TestCase):
             self.assertIn("obstacle_collision_rate", result["metrics"][variant])
             self.assertIn("correction_needed_rate", result["metrics"][variant])
             self.assertIn("obstacle_intervention_rate", result["metrics"][variant])
+            self.assertIn("mean_final_distance_to_goal", result["metrics"][variant])
+            self.assertIn("failure_breakdown", result["metrics"][variant])
             self.assertTrue(np.isfinite(result["metrics"][variant]["success_rate"]))
 
     def test_shield_blocks_obstacle_entering_velocity(self):
@@ -408,6 +419,8 @@ class PhaseThreeObstacleMapTests(unittest.TestCase):
             self.assertIn("pairwise", result["expert_waypoint_baseline"]["metrics"])
             self.assertIn("learned_vs_expert", result)
             self.assertIn("observation_metadata", result)
+            self.assertIn("astar_cache_info", result)
+            self.assertIn("mean_final_distance_to_goal", result["metrics"]["pairwise"])
 
     def test_phase3_cli_scen_smoke_reports_skip_counts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -480,7 +493,10 @@ class PhaseThreeObstacleMapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             list_path = tmp / "maps.txt"
-            list_path.write_text(f"{FIXTURE_MAP} {FIXTURE_SCEN}\n", encoding="utf-8")
+            list_path.write_text(
+                f"# comments are ignored\n{FIXTURE_MAP}\n{FIXTURE_MAP} {FIXTURE_SCEN}\n",
+                encoding="utf-8",
+            )
             output_dir = tmp / "bench"
             plan = build_benchmark_plan(
                 map_scen_list=list_path,
@@ -515,8 +531,78 @@ class PhaseThreeObstacleMapTests(unittest.TestCase):
             written = json.loads((output_dir / "benchmark_plan.json").read_text(encoding="utf-8"))
             self.assertEqual(written["case_count"], 1)
             self.assertEqual(written["cases"][0]["expert_type"], "prioritized_astar")
+            self.assertIsNone(written["cases"][0]["scen_path"])
             status = json.loads((output_dir / "benchmark_status.json").read_text(encoding="utf-8"))
             self.assertEqual(status["state"], "plan_only")
+
+    def test_benchmark_resume_compact_summary_and_compare(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            list_path = tmp / "maps.txt"
+            list_path.write_text(f"{FIXTURE_MAP} {FIXTURE_SCEN}\n", encoding="utf-8")
+            output_dir = tmp / "bench"
+            plan = build_benchmark_plan(
+                map_scen_list=list_path,
+                output_dir=output_dir,
+                agent_counts=(1,),
+                seeds=(17,),
+                train_scenarios=1,
+                eval_scenarios=1,
+                horizon=4,
+                max_steps=12,
+                max_neighbors=1,
+                min_start_goal_distance=2.0,
+                max_samples=20,
+                max_obstacle_tokens=2,
+                obstacle_context_range=4.0,
+                observation_version="obstacle_waypoint_v2",
+                expert_type="independent_astar",
+                smoke=True,
+            )
+            case_dir = output_dir / "case_0000"
+            case_dir.mkdir(parents=True)
+            result_path = case_dir / "phase3_results.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "metrics": {
+                            "none": {
+                                "success_rate": 0.5,
+                                "deadlock_rate": 0.0,
+                                "no_progress_rate": 0.0,
+                                "mean_time_to_goal": 1.0,
+                                "mean_final_distance_to_goal": 0.25,
+                                "failure_breakdown": {"reached_all_goals": 0.5},
+                            },
+                            "pairwise": {
+                                "success_rate": 1.0,
+                                "deadlock_rate": 0.0,
+                                "no_progress_rate": 0.0,
+                                "mean_time_to_goal": 0.8,
+                                "mean_final_distance_to_goal": 0.1,
+                                "failure_breakdown": {"reached_all_goals": 1.0},
+                            },
+                        }
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            summary = run_benchmark_plan(
+                plan,
+                output_dir,
+                plan_only=False,
+                echo_progress=False,
+                skip_completed=True,
+            )
+            self.assertEqual(summary["completed_count"], 1)
+            self.assertEqual(summary["skipped_count"], 1)
+            self.assertTrue((output_dir / "benchmark_compact_summary.json").exists())
+            self.assertTrue((output_dir / "benchmark_compact_summary.csv").exists())
+            self.assertEqual(len(summary["compact_rows"]), 2)
+            comparison = compare_benchmark_summaries(output_dir, output_dir)
+            self.assertEqual(comparison["matched_rows"], 2)
+            self.assertEqual(comparison["left_only_rows"], 0)
 
 
 if __name__ == "__main__":

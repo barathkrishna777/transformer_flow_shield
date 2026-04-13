@@ -1,14 +1,17 @@
 # Continuous MAPF Flow Shield
 
-This workspace implements phase 0 through phase 4 from `research_plan.md`:
+This workspace implements phase 0 through phase 4 from `research_plan.md`, plus foundation work for phases 5 through 7:
 
 - Phase 0: a continuous 2D circular-agent simulator and empty-map expert data generation.
 - Phase 1: a small NumPy attention policy trained by supervised imitation, plus learned-only vs. learned-plus-shield evaluation on empty maps.
 - Phase 2: shield ablations across no shield, velocity clipping, pairwise projection, priority yielding, and a PIBT-inspired priority inheritance/backtracking prototype on adversarial scenarios.
-- Phase 3: static obstacle maps via Moving AI `type octile` `.map` parsing, continuous blocked-cell collision checks, obstacle-free scenario sampling, A* waypoint expert data, obstacle-context observation tokens, map-aware shields, CLI artifacts, and tests.
+- Phase 3: static obstacle maps via Moving AI `type octile` `.map` parsing, optional `.scen` task import, continuous blocked-cell collision checks, obstacle-free scenario sampling, A* waypoint expert data, path-aware obstacle observations, map-aware shields, expert-baseline JSON, CLI artifacts, and tests.
 - Phase 4: scaled empty-map dataset generation plus optional Phase 3 obstacle-map scaling, larger configurable agent/map/neighbor/horizon settings, a NumPy transformer-style policy interface, scaled shield ablations, throughput metrics, and JSON/model/dataset artifacts.
+- Phase 5 foundations: optional shield-correction supervision targets in datasets and rollout/eval metrics for correction/intervention rates. This is not yet a full shield-in-the-loop co-design trainer.
+- Phase 6 foundation: a dependency-free `prioritized_astar` reservation-table waypoint expert for obstacle maps, alongside the default `independent_astar`. This is a coordination baseline, not CBS/ECBS.
+- Phase 7 foundation: a `benchmark-obstacles` planner/runner for multiple Moving AI `.map`/`.scen` entries with plan-only/dry-run mode, smoke limits, per-case JSON, aggregate summaries, and failure reporting for Lambda execution.
 
-The implementation intentionally depends only on NumPy. Phase 4 detects whether PyTorch/CUDA are available and records that diagnostic in results, but the current scalable path uses a NumPy transformer-style fixed attention encoder with a closed-form ridge-regression output head. This is a prototype scaling path, not a full PyTorch transformer trainer.
+The implementation intentionally depends only on NumPy. Phase 4 detects whether PyTorch/CUDA are available and records that diagnostic in results, but the current scalable path uses a NumPy transformer-style fixed attention encoder with a closed-form ridge-regression output head. New transformer runs also append raw self-token features to that output head so path-aware Phase 3 features are not lost behind the random encoder. This is a prototype scaling path, not a full PyTorch transformer trainer.
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -63,7 +66,35 @@ python3 -m flow_shield.cli phase3 \
   --num-agents 8 \
   --train-scenarios 24 \
   --eval-scenarios 8 \
-  --max-obstacle-tokens 8
+  --max-obstacle-tokens 8 \
+  --observation-version obstacle_waypoint_v2
+```
+
+Use the Phase 6 prioritized expert baseline when you want lightweight reservation-table coordination in the generated expert targets and expert JSON baseline:
+
+```bash
+python3 -m flow_shield.cli phase3 \
+  --map tests/fixtures/tiny_obstacle.map \
+  --output-dir runs/phase3_prioritized_smoke \
+  --num-agents 3 \
+  --train-scenarios 2 \
+  --eval-scenarios 1 \
+  --horizon 5 \
+  --max-steps 8 \
+  --expert-type prioritized_astar
+```
+
+Add Phase 5 auxiliary correction targets to a dataset when you want shield-correction supervision artifacts for later co-design work:
+
+```bash
+python3 -m flow_shield.cli generate-data \
+  --scenario-type obstacle_map \
+  --map tests/fixtures/tiny_obstacle.map \
+  --num-scenarios 2 \
+  --num-agents 3 \
+  --horizon 5 \
+  --include-auxiliary-targets \
+  --output datasets/phase5_aux_smoke.npz
 ```
 
 For data generation only:
@@ -82,6 +113,8 @@ Phase 3 writes:
 - `phase3_policy.npz`
 - `phase3_results.json`
 
+Phase 3 obstacle runs default to `obstacle_waypoint_v2`, which keeps the legacy 10-feature token fields and adds fixed-shape self-token path context: next A* waypoint direction, second waypoint direction when available, normalized remaining path length, path availability, and direct goal direction. Legacy artifacts without observation metadata still load as `legacy`.
+
 Moving AI map support expects:
 
 - `type octile`
@@ -91,6 +124,39 @@ Moving AI map support expects:
 - exactly `height` grid rows of length `width`
 
 Passable tiles are `.`, `G`, and `S`; blocked tiles are `@`, `O`, `T`, and `W`. Each grid cell becomes a continuous unit square, so a `7 x 7` map has world bounds `(7.0, 7.0)` unless `--map-cell-size` is changed. Starts and goals are sampled only in free cells with agent-radius plus safety-margin clearance, a minimum start-goal distance, no initial agent-agent overlaps, and an A* reachability check.
+
+Moving AI `.scen` files can be used as the task source:
+
+```bash
+python3 -m flow_shield.cli phase3 \
+  --map tests/fixtures/tiny_obstacle.map \
+  --scenario-source scen \
+  --scen tests/fixtures/tiny_obstacle.scen \
+  --scen-limit 32 \
+  --output-dir runs/phase3_scen \
+  --num-agents 1 \
+  --train-scenarios 8 \
+  --eval-scenarios 4
+```
+
+Standard scenario rows are parsed as `bucket map width height startX startY goalX goalY optimalLength`; starts/goals become continuous cell centers. Tasks that collide for the current radius/clearance, mismatch map dimensions, are too short, or lack an A* path are skipped and reported in `scenario_source_diagnostics.skip_counts`. Scenario grouping is seeded and greedy instead of fixed sequential chunks; grouping failures are also surfaced as diagnostics.
+
+Create a Phase 7 benchmark plan without running training/eval:
+
+```bash
+printf '%s %s\n' tests/fixtures/tiny_obstacle.map tests/fixtures/tiny_obstacle.scen > /tmp/tiny_maps.txt
+python3 -m flow_shield.cli benchmark-obstacles \
+  --map-scen-list /tmp/tiny_maps.txt \
+  --output-dir runs/benchmark_plan_smoke \
+  --agent-counts 1,2 \
+  --seeds 7007 \
+  --expert-type prioritized_astar \
+  --smoke \
+  --limit 1 \
+  --plan-only
+```
+
+On Lambda, use the same command without `--plan-only` and with larger limits. Keep full benchmark runs off laptops: point `--map-scen-list` at a text or JSON list of Moving AI pairs, write to a mounted output directory, and collect `benchmark_plan.json`, `benchmark_summary.json`, and each case's `phase3_results.json`.
 
 Run the phase 4 scaled data/model/evaluation pipeline:
 
@@ -161,6 +227,11 @@ The evaluators report:
 - `max_obstacle_separation_violation`
 - `mean_shield_correction_norm`
 - `max_shield_correction_norm`
+- `correction_needed_rate`
+- `mean_correction_target_norm`
+- `max_correction_target_norm`
+- `obstacle_intervention_rate`
+- `pairwise_intervention_rate`
 - `success_rate`
 - `mean_time_to_goal`
 - `mean_smoothness`
@@ -169,17 +240,23 @@ The evaluators report:
 - `agents_per_second`
 - `mean_agents_per_run`
 
+Obstacle-map Phase 3 and Phase 4 result JSON also includes `expert_waypoint_baseline` and `learned_vs_expert` for the same shield variants. Compare `success_rate`, `deadlock_rate`, `mean_time_to_goal`, and safety metrics there when diagnosing learned-policy liveness.
+
 Prototype notes:
 
 - `velocity_clip` is explicit and measurable, but the simulator also clips commands to `max_speed` during stepping.
 - `pibt` is a one-step continuous priority inheritance/backtracking prototype. It is diagnostic, not a liveness proof; unresolved conflicts remain visible in `final_conflicts`, `collision_rate`, and separation-violation metrics.
-- Phase 4's NumPy transformer policy trains only the output head over fixed random attention features. Results include `backend_diagnostics` and notes documenting this fallback.
-- Phase 3 obstacle experts are per-agent A* waypoint followers. They provide robust supervised velocities for static maps, but they are not joint optimal MAPF solvers and do not import Moving AI `.scen` benchmark files yet.
-- Phase 4 obstacle scaling now works through the Phase 3 static map path for one Moving AI map at a time. It is still the NumPy prototype path, not a full GPU transformer trainer or full benchmark-suite runner.
+- Phase 4's NumPy transformer policy trains only the output head over fixed random attention plus raw self-token features. Results include `backend_diagnostics` and notes documenting this fallback.
+- Phase 3 obstacle experts are per-agent A* waypoint followers. They provide robust supervised velocities and an evaluation baseline for static maps, but they are not joint optimal MAPF solvers.
+- `prioritized_astar` is a simple reservation-table A* baseline that plans agents in priority order with vertex/edge reservations. It can reduce obvious local conflicts in narrow passages, but it is incomplete and can fall back to independent A* if no reserved path is found.
+- Phase 5 is foundation-only: auxiliary targets and metrics are written, but the current NumPy policies still train only velocity outputs.
+- Phase 7 orchestration exists, but full benchmark evidence still needs Lambda-scale runs. Local usage should stay to `--plan-only`, `--smoke`, or tiny fixture cases.
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests
-python3 -m compileall flow_shield tests
+PYTHONPYCACHEPREFIX=/tmp/flow_shield_pycache python3 -m unittest discover -s tests
+PYTHONPYCACHEPREFIX=/tmp/flow_shield_pycache python3 -m compileall flow_shield tests
 ```
+
+The `PYTHONPYCACHEPREFIX` keeps bytecode writes inside a local writable cache on sandboxed macOS setups.

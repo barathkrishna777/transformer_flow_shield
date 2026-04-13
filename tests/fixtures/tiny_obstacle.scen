@@ -1,0 +1,5 @@
+version 1
+0 tiny_obstacle.map 7 7 0 0 6 6 8.485
+0 tiny_obstacle.map 7 7 0 6 6 0 8.485
+0 tiny_obstacle.map 7 7 0 2 5 2 7.000
+0 tiny_obstacle.map 7 7 2 1 6 1 4.000

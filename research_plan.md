@@ -264,12 +264,13 @@ Evaluate: Liveness (do agents get stuck?), Throughput, Success rate.
 
 Implementation status:
 
-- Phase 3 implemented in `flow_shield`: Moving AI `type octile` `.map` parsing, continuous blocked-cell obstacle representation, simulator obstacle projection/reporting, obstacle collision/separation metrics, obstacle-free start/goal sampling with radius clearance and A* reachability checks, per-agent grid A* waypoint expert velocities, obstacle-context observation tokens, map-aware shield diagnostics/projection, and focused tests.
+- Phase 3 implemented in `flow_shield`: Moving AI `type octile` `.map` parsing, Moving AI `.scen` row parsing for one-map task sources, continuous blocked-cell obstacle representation, simulator obstacle projection/reporting, obstacle collision/separation metrics, obstacle-free start/goal sampling with radius clearance and A* reachability checks, per-agent grid A* waypoint expert velocities, path-aware `obstacle_waypoint_v2` observation tokens, map-aware shield diagnostics/projection, expert waypoint baseline evaluation, and focused tests.
 - Added Phase 3 CLI/data workflow:
   - `python3 -m flow_shield.cli phase3 --map tests/fixtures/tiny_obstacle.map --output-dir runs/phase3`
   - `python3 -m flow_shield.cli generate-data --scenario-type obstacle_map --map tests/fixtures/tiny_obstacle.map --max-obstacle-tokens 8 --output datasets/phase3_obstacle_train.npz`
 - Expected Phase 3 artifacts: `phase3_obstacle_dataset.npz`, `phase3_policy.npz`, and `phase3_results.json`.
-- Limitations: the expert is per-agent A* plus continuous waypoint following, not a joint CBS/ECBS expert; Moving AI `.scen` benchmark-pair import is not implemented; Phase 3 evaluates one static map at a time and surfaces unresolved obstacle/agent interactions in JSON metrics and shield diagnostics.
+- Current liveness hardening: Phase 3 obstacle runs default to `obstacle_waypoint_v2`, which adds next/second A* waypoint directions, normalized remaining path length, path availability, and direct goal direction while preserving legacy loading for older 10-feature artifacts. The NumPy transformer output head can consume raw self-token features directly, so the supervised ridge head can imitate waypoint velocities instead of relying only on random encoded features. JSON includes `expert_waypoint_baseline` plus learned-vs-expert deltas for success, deadlock, time-to-goal, and safety metrics.
+- Limitations: the expert is per-agent A* plus continuous waypoint following, not a joint CBS/ECBS expert; `.scen` support parses standard rows and reports skipped invalid tasks but does not yet orchestrate full benchmark suites; Phase 3 evaluates one static map at a time and surfaces unresolved obstacle/agent interactions in JSON metrics and shield diagnostics.
 
 Phase 4: Scaling Model + Data
 
@@ -279,7 +280,7 @@ Improve model: Larger transformer, Add attention over neighbors, Possibly graph 
 
 Implementation status:
 
-- Phase 4 implemented in `flow_shield`: scaled empty-map scenario/data generation supports larger agent counts, map sizes, neighbor windows, horizons, reproducible seeds, and optional sample caps for CPU-bounded runs. Phase 4 can also run obstacle-map scaling through the Phase 3 Moving AI map path with `scenario_type="obstacle_map"`, `map_path`, and nonzero `max_obstacle_tokens`.
+- Phase 4 implemented in `flow_shield`: scaled empty-map scenario/data generation supports larger agent counts, map sizes, neighbor windows, horizons, reproducible seeds, and optional sample caps for CPU-bounded runs. Phase 4 can also run obstacle-map scaling through the Phase 3 Moving AI map path with `scenario_type="obstacle_map"`, `map_path`, nonzero `max_obstacle_tokens`, optional `.scen` task sources, and the same expert waypoint baseline JSON.
 - Added a configurable phase 4 experiment path with a NumPy transformer-style policy interface. The current scalable backend uses a fixed random multi-head attention encoder and trains a ridge-regression output head. PyTorch is not a required dependency; runs detect/report PyTorch and CUDA availability in `backend_diagnostics`.
 - Added scaled evaluation over Phase 2 shield variants (`none`, `velocity_clip`, `pairwise`, `priority`, and `pibt`) with the existing rollout/evaluation APIs.
 - Added throughput/scaling metrics: `steps_per_second`, `agents_per_second`, and `mean_agents_per_run`, while preserving collision rate, pair collisions, min-separation violation, shield correction norms, smoothness, time to goal, success rate, and deadlock rate.
@@ -287,7 +288,7 @@ Implementation status:
   - `python3 -m flow_shield.cli phase4 --output-dir runs/phase4`
   - `python3 -m flow_shield.cli phase4-eval --model runs/phase4/phase4_policy.npz --output results/phase4_eval.json`
 - Expected Phase 4 artifacts: `phase4_scaled_dataset.npz`, `phase4_policy.npz`, and `phase4_results.json`.
-- Prototype limitation: Phase 4 obstacle scaling now uses the Phase 3 static-map sampler and per-agent A* expert on one Moving AI map at a time. It still does not import `.scen` benchmark tasks or train a full PyTorch/GPU transformer backend.
+- Prototype limitation: Phase 4 obstacle scaling now uses the Phase 3 static-map sampler or `.scen` task source plus the per-agent A* expert on one Moving AI map at a time. It still does not run a full benchmark-suite manager or train a full PyTorch/GPU transformer backend.
 
 Phase 5: Learned + Shield Co-Design
 
@@ -299,6 +300,13 @@ Penalize motions that require heavy correction.
 
 Predict uncertainty / confidence.
 
+Implementation status:
+
+- Phase 5 foundations implemented in `flow_shield`: dataset generation can optionally store auxiliary shield-correction targets with `include_auxiliary_targets=True` or CLI `--include-auxiliary-targets`.
+- Auxiliary target schema is optional and backward-compatible with old datasets. Current targets include correction vector, correction norm, correction-needed flag, unsafe-command flag, obstacle-intervention flag, and pairwise-intervention flag.
+- Rollout/eval JSON now reports `correction_needed_rate`, `mean_correction_target_norm`, `max_correction_target_norm`, `obstacle_intervention_rate`, and `pairwise_intervention_rate`.
+- Limitation: the current NumPy policies still train only the velocity output. This is not yet a full learned+shield co-design trainer or auxiliary-head model.
+
 Phase 6: Advanced Shield Improvements
 
 Priority inheritance graph (PIBT-like)
@@ -309,6 +317,13 @@ Temporary goal reassignment
 
 Backtracking policies
 
+Implementation status:
+
+- Phase 6 foundation implemented as a lightweight obstacle-map coordination expert: `expert_type="prioritized_astar"` uses a deterministic reservation-table A* baseline with vertex/edge reservations and wait actions.
+- The original `expert_type="independent_astar"` behavior remains the default. Expert type is stored in dataset, model, and evaluation JSON.
+- CLI support: pass `--expert-type prioritized_astar` to Phase 3/4 obstacle-map dataset runs and benchmark plans.
+- Limitation: `prioritized_astar` is a dependency-free baseline, not CBS/ECBS and not a complete joint solver. It can fall back to independent A* when a reservation-constrained path is not found.
+
 Phase 7: Stress Testing
 
 Dense crowd scenarios
@@ -316,6 +331,15 @@ Dense crowd scenarios
 Narrow corridors
 
 Adversarial setups
+
+Implementation status:
+
+- Phase 7 foundation implemented as `python3 -m flow_shield.cli benchmark-obstacles`.
+- The runner accepts a text or JSON list of Moving AI `.map`/`.scen` pairs, agent counts, seeds, observation version, expert type, train/eval limits, `--smoke`, `--limit`, and `--plan-only`/`--dry-run`.
+- Plan-only mode writes `benchmark_plan.json` and `benchmark_summary.json` without running training/eval, which is the recommended local validation path.
+- Execution mode writes per-case Phase 3 result JSON under the output directory and an aggregate summary with failed/skipped case reporting.
+- Lambda guidance: generate/validate a plan locally with tiny fixture data, then run the same command on Lambda without `--plan-only` and with real Moving AI lists, larger train/eval limits, and mounted output storage.
+- Limitation: this is orchestration around the current NumPy Phase 3/4 pipeline, not proof of large-scale performance. Full benchmark claims require Lambda-scale runs.
 
 4. Additional Components
 

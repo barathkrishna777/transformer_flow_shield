@@ -8,10 +8,19 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional
 
+import numpy as np
+
 from .config import DatasetConfig, ModelConfig, SimConfig
 from .dataset import TrajectoryDataset, build_dataset, scenario_to_jsonable
-from .expert import generate_scenarios, straight_line_velocity
-from .maps import load_obstacle_map, map_metadata
+from .expert import (
+    generate_scenarios,
+    normalize_expert_type,
+    obstacle_map_expert_velocity,
+    obstacle_map_velocity,
+    scen_task_diagnostics,
+    straight_line_velocity,
+)
+from .maps import load_moving_ai_scen, load_obstacle_map, map_metadata
 from .metrics import aggregate_rollouts
 from .model import NumpyAttentionPolicy, load_policy, make_policy, policy_from_model
 from .scenarios import NamedScenario, phase2_adversarial_scenarios
@@ -25,7 +34,11 @@ def train_phase1_model(
     model_config: ModelConfig,
     verbose: bool = False,
 ) -> tuple[NumpyAttentionPolicy, Dict[str, list]]:
+    if model_config.feature_dim != int(dataset.observations.shape[2]):
+        model_config = replace(model_config, feature_dim=int(dataset.observations.shape[2]))
     model = NumpyAttentionPolicy.from_config(model_config, sim_config)
+    model.observation_version = str(dataset.dataset_config.get("observation_version", "legacy"))
+    model.observation_metadata = dict(dataset.dataset_config.get("observation_metadata", {}))
     history = model.fit(
         dataset.observations,
         dataset.masks,
@@ -80,7 +93,11 @@ def train_phase4_model(
 ):
     """Train the configured phase 4 policy interface."""
 
+    if model_config.feature_dim != int(dataset.observations.shape[2]):
+        model_config = replace(model_config, feature_dim=int(dataset.observations.shape[2]))
     model = make_policy(model_config, sim_config)
+    model.observation_version = str(dataset.dataset_config.get("observation_version", "legacy"))
+    model.observation_metadata = dict(dataset.dataset_config.get("observation_metadata", {}))
     history = model.fit(
         dataset.observations,
         dataset.masks,
@@ -105,10 +122,16 @@ def evaluate_phase1_model(
         max_neighbors=dataset_config.max_neighbors,
         min_start_goal_distance=dataset_config.min_start_goal_distance,
         scenario_type=dataset_config.scenario_type,
+        scenario_source=dataset_config.scenario_source,
         map_path=dataset_config.map_path,
         map_cell_size=dataset_config.map_cell_size,
+        scen_path=dataset_config.scen_path,
+        scen_limit=dataset_config.scen_limit,
         max_obstacle_tokens=dataset_config.max_obstacle_tokens,
         obstacle_context_range=dataset_config.obstacle_context_range,
+        observation_version=dataset_config.observation_version,
+        expert_type=dataset_config.expert_type,
+        include_auxiliary_targets=dataset_config.include_auxiliary_targets,
         seed=dataset_config.seed + 1000 if seed is None else seed,
         include_reached_agents=dataset_config.include_reached_agents,
     )
@@ -124,6 +147,7 @@ def evaluate_phase1_model(
         obstacle_map=obstacle_map,
         max_obstacle_tokens=dataset_config.max_obstacle_tokens,
         obstacle_context_range=dataset_config.obstacle_context_range,
+        observation_version=dataset_config.observation_version,
     )
     shield = CollisionShield(sim_config, mode="priority")
 
@@ -195,12 +219,13 @@ def _rollout_scalar_summary(result: Dict[str, object]) -> Dict[str, object]:
         "max_obstacle_separation_violation": float(
             result.get("max_obstacle_separation_violation", 0.0)
         ),
-        "mean_shield_correction_norm": float(
-            result.get("mean_shield_correction_norm", 0.0)
-        ),
-        "max_shield_correction_norm": float(
-            result.get("max_shield_correction_norm", 0.0)
-        ),
+        "mean_shield_correction_norm": float(result.get("mean_shield_correction_norm", 0.0)),
+        "max_shield_correction_norm": float(result.get("max_shield_correction_norm", 0.0)),
+        "correction_needed_rate": float(result.get("correction_needed_rate", 0.0)),
+        "mean_correction_target_norm": float(result.get("mean_correction_target_norm", 0.0)),
+        "max_correction_target_norm": float(result.get("max_correction_target_norm", 0.0)),
+        "obstacle_intervention_rate": float(result.get("obstacle_intervention_rate", 0.0)),
+        "pairwise_intervention_rate": float(result.get("pairwise_intervention_rate", 0.0)),
     }
 
 
@@ -344,6 +369,26 @@ def _obstacle_map_from_config(dataset_config: DatasetConfig):
     )
 
 
+def _scenario_source_diagnostics(
+    dataset_config: DatasetConfig,
+    sim_config: SimConfig,
+) -> Dict[str, object]:
+    if dataset_config.scenario_source != "scen" or dataset_config.scen_path is None:
+        return {"scenario_source": dataset_config.scenario_source}
+    obstacle_map = _obstacle_map_from_config(dataset_config)
+    if obstacle_map is None:
+        return {
+            "scenario_source": dataset_config.scenario_source,
+            "scen_path": dataset_config.scen_path,
+            "raw_tasks": 0,
+            "valid_tasks": 0,
+            "skipped_tasks": 0,
+            "skip_reason": "missing obstacle map",
+        }
+    scenario_config = replace(sim_config, world_size=obstacle_map.world_size)
+    return scen_task_diagnostics(dataset_config, scenario_config, obstacle_map)
+
+
 def _policy_for_dataset(model, dataset_config: DatasetConfig, sim_config: SimConfig):
     obstacle_map = _obstacle_map_from_config(dataset_config)
     policy_sim_config = (
@@ -358,7 +403,88 @@ def _policy_for_dataset(model, dataset_config: DatasetConfig, sim_config: SimCon
         obstacle_map=obstacle_map,
         max_obstacle_tokens=dataset_config.max_obstacle_tokens,
         obstacle_context_range=dataset_config.obstacle_context_range,
+        observation_version=dataset_config.observation_version,
     )
+
+
+def _expert_waypoint_policy(
+    sim_config: SimConfig,
+    obstacle_map,
+    expert_type: str = "independent_astar",
+):
+    def _policy(positions, velocities, goals, radii):
+        del velocities
+        if obstacle_map is None:
+            return straight_line_velocity(positions, goals, sim_config)
+        return obstacle_map_expert_velocity(
+            positions,
+            goals,
+            sim_config,
+            obstacle_map,
+            radii=radii,
+            expert_type=expert_type,
+        )
+
+    return _policy
+
+
+def _expert_waypoint_baseline(
+    sim_config: SimConfig,
+    named_scenarios: Iterable[NamedScenario],
+    variants: Optional[Iterable[str]] = None,
+    max_iterations: int = 12,
+    damping: float = 1.0,
+    expert_type: str = "independent_astar",
+) -> Dict[str, object]:
+    named_scenarios = list(named_scenarios)
+    if not named_scenarios or named_scenarios[0].scenario.obstacle_map is None:
+        return {}
+    policy_sim = sim_config_for_scenario(sim_config, named_scenarios[0].scenario)
+    return _evaluate_named_shield_ablations(
+        _expert_waypoint_policy(
+            policy_sim,
+            named_scenarios[0].scenario.obstacle_map,
+            expert_type=expert_type,
+        ),
+        sim_config,
+        named_scenarios=named_scenarios,
+        variants=variants,
+        max_iterations=max_iterations,
+        damping=damping,
+        phase="expert_waypoint_baseline",
+        notes=[
+            f"Expert baseline rolls out {expert_type} waypoint targets directly without training.",
+        ],
+    )
+
+
+def _learned_vs_expert_comparison(
+    learned_metrics: Dict[str, Dict[str, float]],
+    expert_metrics: Dict[str, Dict[str, float]],
+) -> Dict[str, Dict[str, float]]:
+    keys = (
+        "success_rate",
+        "deadlock_rate",
+        "mean_time_to_goal",
+        "collision_rate",
+        "pair_collisions_per_run",
+        "obstacle_collision_rate",
+        "obstacle_collisions_per_run",
+        "mean_obstacle_separation_violation",
+        "max_obstacle_separation_violation",
+    )
+    comparison: Dict[str, Dict[str, float]] = {}
+    for variant, learned in learned_metrics.items():
+        expert = expert_metrics.get(variant)
+        if expert is None:
+            continue
+        comparison[variant] = {
+            f"{key}_delta_learned_minus_expert": float(
+                learned.get(key, 0.0) - expert.get(key, 0.0)
+            )
+            for key in keys
+        }
+    return comparison
 
 
 def _phase4_notes(dataset_config: Optional[DatasetConfig] = None) -> list[str]:
@@ -369,7 +495,7 @@ def _phase4_notes(dataset_config: Optional[DatasetConfig] = None) -> list[str]:
     if dataset_config is not None and dataset_config.scenario_type == "obstacle_map":
         notes.insert(
             0,
-            "Phase 4 obstacle scaling is enabled through the Phase 3 Moving AI map path; this prototype samples from one static map at a time and does not yet ingest Moving AI .scen benchmark files.",
+            "Phase 4 obstacle scaling is enabled through the Phase 3 Moving AI map path; sampled maps and Moving AI .scen task sources are both available for one static map at a time.",
         )
     else:
         notes.insert(
@@ -393,8 +519,14 @@ def _phase4_eval_dataset_config(
         scenario_type=dataset_config.scenario_type,
         map_path=dataset_config.map_path,
         map_cell_size=dataset_config.map_cell_size,
+        scenario_source=dataset_config.scenario_source,
+        scen_path=dataset_config.scen_path,
+        scen_limit=dataset_config.scen_limit,
         max_obstacle_tokens=dataset_config.max_obstacle_tokens,
         obstacle_context_range=dataset_config.obstacle_context_range,
+        observation_version=dataset_config.observation_version,
+        expert_type=dataset_config.expert_type,
+        include_auxiliary_targets=dataset_config.include_auxiliary_targets,
         seed=dataset_config.seed + 10_000 if seed is None else seed,
         include_reached_agents=dataset_config.include_reached_agents,
         max_samples=None,
@@ -446,9 +578,28 @@ def evaluate_phase4_ablations(
         notes=_phase4_notes(dataset_config),
     )
     result["dataset_config"] = dataset_config.to_dict()
+    result["expert_type"] = normalize_expert_type(dataset_config.expert_type)
     result["map_metadata"] = map_info
+    result["scenario_source_diagnostics"] = _scenario_source_diagnostics(
+        dataset_config,
+        sim_config,
+    )
     result["max_neighbors"] = int(dataset_config.max_neighbors)
     result["policy"] = model.__class__.__name__
+    if map_info is not None:
+        expert = _expert_waypoint_baseline(
+            sim_config,
+            named_scenarios,
+            variants=variants,
+            max_iterations=max_iterations,
+            damping=damping,
+            expert_type=dataset_config.expert_type,
+        )
+        result["expert_waypoint_baseline"] = expert
+        result["learned_vs_expert"] = _learned_vs_expert_comparison(
+            result["metrics"],
+            expert.get("metrics", {}),
+        )
     return result
 
 
@@ -457,7 +608,7 @@ def _phase3_notes() -> list[str]:
         "Phase 3 uses static Moving AI type=octile maps with blocked cells converted to continuous unit-cell AABBs.",
         "The obstacle expert is a per-agent octile A* planner with continuous waypoint following; it does not solve full multi-agent CBS/ECBS over obstacles.",
         "Obstacle-aware shields constrain one-step commands against static obstacles and keep reporting any unresolved obstacle or agent-agent conflicts in diagnostics and metrics.",
-        "Moving AI .scen benchmark import is not implemented; scenarios are sampled from free cells with clearance and A* reachability checks.",
+        "Moving AI .scen benchmark rows can be imported as obstacle-map start/goal tasks; invalid tasks for the current radius/clearance are skipped during scenario construction.",
     ]
 
 
@@ -503,9 +654,27 @@ def evaluate_phase3_ablations(
         notes=_phase3_notes(),
     )
     result["dataset_config"] = dataset_config.to_dict()
+    result["expert_type"] = normalize_expert_type(dataset_config.expert_type)
     result["map_metadata"] = map_info
+    result["scenario_source_diagnostics"] = _scenario_source_diagnostics(
+        dataset_config,
+        sim_config,
+    )
     result["max_neighbors"] = int(dataset_config.max_neighbors)
     result["policy"] = model.__class__.__name__
+    expert = _expert_waypoint_baseline(
+        sim_config,
+        named_scenarios,
+        variants=variants,
+        max_iterations=max_iterations,
+        damping=damping,
+        expert_type=dataset_config.expert_type,
+    )
+    result["expert_waypoint_baseline"] = expert
+    result["learned_vs_expert"] = _learned_vs_expert_comparison(
+        result["metrics"],
+        expert.get("metrics", {}),
+    )
     return result
 
 
@@ -544,6 +713,8 @@ def run_phase3_experiment(
         scenario_type="obstacle_map",
         map_path=str(map_path),
         max_obstacle_tokens=max(1, int(dataset_config.max_obstacle_tokens)),
+        observation_version="obstacle_waypoint_v2",
+        expert_type=normalize_expert_type(dataset_config.expert_type),
     )
     model_config = model_config or ModelConfig(
         d_model=32,
@@ -559,6 +730,8 @@ def run_phase3_experiment(
 
     diagnostics = backend_diagnostics(model_config.policy_type)
     dataset = build_dataset(dataset_config, sim_config)
+    if model_config.feature_dim != int(dataset.observations.shape[2]):
+        model_config = replace(model_config, feature_dim=int(dataset.observations.shape[2]))
     dataset_path = output_dir / "phase3_obstacle_dataset.npz"
     dataset.save(dataset_path)
 
@@ -579,6 +752,10 @@ def run_phase3_experiment(
             "history": history,
             "backend_diagnostics": diagnostics,
             "map_metadata": map_info,
+            "observation_version": dataset_config.observation_version,
+            "observation_metadata": dataset.dataset_config.get("observation_metadata"),
+            "auxiliary_target_metadata": dataset.dataset_config.get("auxiliary_target_metadata"),
+            "expert_type": dataset_config.expert_type,
             "notes": _phase3_notes(),
         },
     )
@@ -610,14 +787,24 @@ def run_phase3_experiment(
             "masks": list(dataset.masks.shape),
             "targets": list(dataset.targets.shape),
         },
+        "observation_version": dataset_config.observation_version,
+        "observation_metadata": dataset.dataset_config.get("observation_metadata"),
+        "auxiliary_target_metadata": dataset.dataset_config.get("auxiliary_target_metadata"),
+        "expert_type": dataset_config.expert_type,
         "history": history,
         "metrics": ablations["metrics"],
         "ablations": ablations,
+        "expert_waypoint_baseline": ablations.get("expert_waypoint_baseline", {}),
+        "learned_vs_expert": ablations.get("learned_vs_expert", {}),
         "backend_diagnostics": diagnostics,
         "notes": _phase3_notes(),
         "sim_config": sim_config.to_dict(),
         "dataset_config": dataset_config.to_dict(),
         "eval_dataset_config": eval_config.to_dict(),
+        "scenario_source_diagnostics": _scenario_source_diagnostics(
+            dataset_config,
+            sim_config,
+        ),
         "model_config": model_config.to_dict(),
         "map_metadata": map_info,
     }
@@ -686,11 +873,19 @@ def run_phase4_experiment(
         ridge_lambda=1e-3,
         seed=dataset_config.seed + 17,
     )
+    if dataset_config.scenario_type == "obstacle_map" and dataset_config.observation_version == "legacy":
+        dataset_config = replace(dataset_config, observation_version="obstacle_waypoint_v2")
+    dataset_config = replace(
+        dataset_config,
+        expert_type=normalize_expert_type(dataset_config.expert_type),
+    )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     diagnostics = backend_diagnostics(model_config.policy_type)
     dataset = build_dataset(dataset_config, sim_config)
+    if model_config.feature_dim != int(dataset.observations.shape[2]):
+        model_config = replace(model_config, feature_dim=int(dataset.observations.shape[2]))
     dataset_path = output_dir / "phase4_scaled_dataset.npz"
     dataset.save(dataset_path)
 
@@ -709,6 +904,10 @@ def run_phase4_experiment(
             "model_config": model_config.to_dict(),
             "history": history,
             "backend_diagnostics": diagnostics,
+            "observation_version": dataset_config.observation_version,
+            "observation_metadata": dataset.dataset_config.get("observation_metadata"),
+            "auxiliary_target_metadata": dataset.dataset_config.get("auxiliary_target_metadata"),
+            "expert_type": dataset_config.expert_type,
             "notes": _phase4_notes(dataset_config),
         },
     )
@@ -739,15 +938,25 @@ def run_phase4_experiment(
             "masks": list(dataset.masks.shape),
             "targets": list(dataset.targets.shape),
         },
+        "observation_version": dataset_config.observation_version,
+        "observation_metadata": dataset.dataset_config.get("observation_metadata"),
+        "auxiliary_target_metadata": dataset.dataset_config.get("auxiliary_target_metadata"),
+        "expert_type": dataset_config.expert_type,
         "history": history,
         "metrics": ablations["metrics"],
         "ablations": ablations,
+        "expert_waypoint_baseline": ablations.get("expert_waypoint_baseline", {}),
+        "learned_vs_expert": ablations.get("learned_vs_expert", {}),
         "backend_diagnostics": diagnostics,
         "notes": _phase4_notes(dataset_config),
         "sim_config": sim_config.to_dict(),
         "dataset_config": dataset_config.to_dict(),
         "eval_dataset_config": eval_config.to_dict(),
         "map_metadata": ablations.get("map_metadata"),
+        "scenario_source_diagnostics": _scenario_source_diagnostics(
+            dataset_config,
+            sim_config,
+        ),
         "model_config": model_config.to_dict(),
     }
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -788,6 +997,8 @@ def run_phase1_experiment(
             "dataset_config": dataset_config.to_dict(),
             "model_config": model_config.to_dict(),
             "history": history,
+            "observation_version": dataset_config.observation_version,
+            "observation_metadata": dataset.dataset_config.get("observation_metadata"),
         },
     )
 

@@ -185,6 +185,9 @@ def rollout(
     shield_diagnostics = []
     shield_mean_corrections = []
     shield_max_corrections = []
+    shield_correction_needed = []
+    shield_obstacle_interventions = []
+    shield_pairwise_interventions = []
     separation_violations = []
     obstacle_separation_violations = []
     collision_count = 0
@@ -211,8 +214,17 @@ def rollout(
             shield_mean_corrections.append(
                 float(getattr(diagnostics, "mean_correction_norm", 0.0))
             )
-            shield_max_corrections.append(
-                float(getattr(diagnostics, "max_correction_norm", 0.0))
+            max_correction = float(getattr(diagnostics, "max_correction_norm", 0.0))
+            shield_max_corrections.append(max_correction)
+            initial_obstacle = int(getattr(diagnostics, "initial_obstacle_conflicts", 0))
+            initial_total = int(getattr(diagnostics, "initial_conflicts", 0))
+            obstacle_blocked = int(getattr(diagnostics, "obstacle_blocked_agents", 0))
+            shield_correction_needed.append(float(max_correction > 1e-8))
+            shield_obstacle_interventions.append(
+                float(initial_obstacle > 0 or obstacle_blocked > 0)
+            )
+            shield_pairwise_interventions.append(
+                float(max(0, initial_total - initial_obstacle) > 0)
             )
         record = world.step(commands)
         records.append(record)
@@ -277,6 +289,25 @@ def rollout(
         ),
         "max_shield_correction_norm": (
             float(np.max(shield_max_corrections)) if shield_max_corrections else 0.0
+        ),
+        "correction_needed_rate": (
+            float(np.mean(shield_correction_needed)) if shield_correction_needed else 0.0
+        ),
+        "mean_correction_target_norm": (
+            float(np.mean(shield_mean_corrections)) if shield_mean_corrections else 0.0
+        ),
+        "max_correction_target_norm": (
+            float(np.max(shield_max_corrections)) if shield_max_corrections else 0.0
+        ),
+        "obstacle_intervention_rate": (
+            float(np.mean(shield_obstacle_interventions))
+            if shield_obstacle_interventions
+            else 0.0
+        ),
+        "pairwise_intervention_rate": (
+            float(np.mean(shield_pairwise_interventions))
+            if shield_pairwise_interventions
+            else 0.0
         ),
         "shield_diagnostics": shield_diagnostics,
         "wall_time_seconds": float(wall_time_seconds),

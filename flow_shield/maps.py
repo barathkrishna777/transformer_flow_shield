@@ -15,6 +15,19 @@ EPS = 1e-9
 
 
 @dataclass(frozen=True)
+class MovingAIScenarioTask:
+    """One standard Moving AI .scen benchmark row."""
+
+    bucket: int
+    map_name: str
+    map_width: int
+    map_height: int
+    start: np.ndarray
+    goal: np.ndarray
+    optimal_length: float
+
+
+@dataclass(frozen=True)
 class GridMap:
     """Static grid obstacle map embedded in a continuous 2D world.
 
@@ -412,8 +425,60 @@ def load_obstacle_map(path: Optional[str | Path], cell_size: float = 1.0) -> Opt
     return load_moving_ai_map(path, cell_size=cell_size)
 
 
+def load_moving_ai_scen(
+    path: str | Path,
+    cell_size: float = 1.0,
+    limit: Optional[int] = None,
+) -> List[MovingAIScenarioTask]:
+    """Parse standard Moving AI .scen rows into continuous cell-center tasks."""
+
+    path = Path(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    tasks: List[MovingAIScenarioTask] = []
+    for raw_index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if raw_index == 0 and line.lower().startswith("version"):
+            continue
+        parts = line.split()
+        if len(parts) < 9:
+            raise ValueError(f"Invalid Moving AI scen row in {path}: {raw_line!r}")
+        try:
+            bucket = int(parts[0])
+            map_name = parts[1]
+            map_width = int(parts[2])
+            map_height = int(parts[3])
+            start_x = int(parts[4])
+            start_y = int(parts[5])
+            goal_x = int(parts[6])
+            goal_y = int(parts[7])
+            optimal_length = float(parts[8])
+        except ValueError as exc:
+            raise ValueError(f"Invalid Moving AI scen row in {path}: {raw_line!r}") from exc
+        tasks.append(
+            MovingAIScenarioTask(
+                bucket=bucket,
+                map_name=map_name,
+                map_width=map_width,
+                map_height=map_height,
+                start=np.array(
+                    [(float(start_x) + 0.5) * cell_size, (float(start_y) + 0.5) * cell_size],
+                    dtype=np.float64,
+                ),
+                goal=np.array(
+                    [(float(goal_x) + 0.5) * cell_size, (float(goal_y) + 0.5) * cell_size],
+                    dtype=np.float64,
+                ),
+                optimal_length=optimal_length,
+            )
+        )
+        if limit is not None and len(tasks) >= int(limit):
+            break
+    return tasks
+
+
 def map_metadata(obstacle_map: Optional[GridMap]) -> Optional[Dict[str, object]]:
     if obstacle_map is None:
         return None
     return obstacle_map.metadata()
-

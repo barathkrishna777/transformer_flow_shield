@@ -9,7 +9,7 @@ from typing import Dict, Tuple
 import numpy as np
 
 from .config import ModelConfig, SimConfig
-from .dataset import FEATURE_DIM, encode_joint_observation
+from .dataset import FEATURE_DIM, encode_joint_observation, normalize_observation_version
 from .geometry import clip_by_norm
 from .maps import GridMap
 
@@ -33,6 +33,8 @@ class NumpyAttentionPolicy:
         self.feature_dim = int(feature_dim)
         self.d_model = int(d_model)
         self.max_speed = float(max_speed)
+        self.observation_version = "legacy"
+        self.observation_metadata: Dict[str, object] = {}
         rng = np.random.default_rng(seed)
         scale_in = 1.0 / np.sqrt(max(self.feature_dim, 1))
         scale_hidden = 1.0 / np.sqrt(max(self.d_model, 1))
@@ -114,6 +116,7 @@ class NumpyAttentionPolicy:
         obstacle_map: GridMap | None = None,
         max_obstacle_tokens: int = 0,
         obstacle_context_range: float = 4.0,
+        observation_version: str | None = None,
     ) -> np.ndarray:
         observations, masks = encode_joint_observation(
             positions,
@@ -125,6 +128,7 @@ class NumpyAttentionPolicy:
             obstacle_map=obstacle_map,
             max_obstacle_tokens=max_obstacle_tokens,
             obstacle_context_range=obstacle_context_range,
+            observation_version=observation_version or self.observation_version,
         )
         return self.predict_batch(observations, masks)
 
@@ -275,6 +279,10 @@ class NumpyAttentionPolicy:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         arrays = dict(self.params)
+        payload = metadata or {}
+        observation_version = normalize_observation_version(
+            payload.get("observation_version", self.observation_version)
+        )
         arrays["metadata"] = np.array(
             json.dumps(
                 {
@@ -282,7 +290,12 @@ class NumpyAttentionPolicy:
                     "d_model": self.d_model,
                     "max_speed": self.max_speed,
                     "policy_type": "numpy_attention",
-                    "metadata": metadata or {},
+                    "observation_version": observation_version,
+                    "observation_metadata": payload.get(
+                        "observation_metadata",
+                        self.observation_metadata,
+                    ),
+                    "metadata": payload,
                 }
             )
         )
@@ -298,6 +311,12 @@ class NumpyAttentionPolicy:
             max_speed=float(metadata["max_speed"]),
             seed=0,
         )
+        model.observation_version = normalize_observation_version(
+            metadata.get("observation_version")
+            or metadata.get("metadata", {}).get("observation_version")
+            or metadata.get("metadata", {}).get("dataset_config", {}).get("observation_version")
+        )
+        model.observation_metadata = dict(metadata.get("observation_metadata", {}))
         for name in model.params:
             model.params[name] = np.asarray(data[name], dtype=np.float64)
         return model
@@ -320,6 +339,7 @@ class NumpyTransformerPolicy:
         num_layers: int = 2,
         max_speed: float = 1.2,
         ridge_lambda: float = 1e-3,
+        include_raw_features: bool = True,
         seed: int = 0,
     ):
         self.feature_dim = int(feature_dim)
@@ -328,6 +348,9 @@ class NumpyTransformerPolicy:
         self.num_layers = int(num_layers)
         self.max_speed = float(max_speed)
         self.ridge_lambda = float(ridge_lambda)
+        self.include_raw_features = bool(include_raw_features)
+        self.observation_version = "legacy"
+        self.observation_metadata: Dict[str, object] = {}
         if self.d_model <= 0:
             raise ValueError("d_model must be positive.")
         if self.num_heads <= 0:
@@ -371,7 +394,7 @@ class NumpyTransformerPolicy:
 
     @property
     def output_feature_dim(self) -> int:
-        return self.d_model * 2
+        return self.d_model * 2 + (self.feature_dim if self.include_raw_features else 0)
 
     @classmethod
     def from_config(cls, config: ModelConfig, sim_config: SimConfig) -> "NumpyTransformerPolicy":
@@ -425,6 +448,8 @@ class NumpyTransformerPolicy:
         pooled = np.sum(z, axis=1) / counts
         self_token = z[:, 0, :]
         features = np.concatenate([self_token, pooled], axis=1)
+        if self.include_raw_features:
+            features = np.concatenate([features, observations[:, 0, :]], axis=1)
         return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
     def predict_batch(self, observations: np.ndarray, masks: np.ndarray) -> np.ndarray:
@@ -443,6 +468,7 @@ class NumpyTransformerPolicy:
         obstacle_map: GridMap | None = None,
         max_obstacle_tokens: int = 0,
         obstacle_context_range: float = 4.0,
+        observation_version: str | None = None,
     ) -> np.ndarray:
         observations, masks = encode_joint_observation(
             positions,
@@ -454,6 +480,7 @@ class NumpyTransformerPolicy:
             obstacle_map=obstacle_map,
             max_obstacle_tokens=max_obstacle_tokens,
             obstacle_context_range=obstacle_context_range,
+            observation_version=observation_version or self.observation_version,
         )
         return self.predict_batch(observations, masks)
 
@@ -553,6 +580,10 @@ class NumpyTransformerPolicy:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         arrays = dict(self.params)
+        payload = metadata or {}
+        observation_version = normalize_observation_version(
+            payload.get("observation_version", self.observation_version)
+        )
         arrays["metadata"] = np.array(
             json.dumps(
                 {
@@ -562,8 +593,14 @@ class NumpyTransformerPolicy:
                     "num_layers": self.num_layers,
                     "max_speed": self.max_speed,
                     "ridge_lambda": self.ridge_lambda,
+                    "include_raw_features": self.include_raw_features,
                     "policy_type": "numpy_transformer",
-                    "metadata": metadata or {},
+                    "observation_version": observation_version,
+                    "observation_metadata": payload.get(
+                        "observation_metadata",
+                        self.observation_metadata,
+                    ),
+                    "metadata": payload,
                 }
             )
         )
@@ -580,8 +617,15 @@ class NumpyTransformerPolicy:
             num_layers=int(metadata["num_layers"]),
             max_speed=float(metadata["max_speed"]),
             ridge_lambda=float(metadata.get("ridge_lambda", 1e-3)),
+            include_raw_features=bool(metadata.get("include_raw_features", False)),
             seed=0,
         )
+        model.observation_version = normalize_observation_version(
+            metadata.get("observation_version")
+            or metadata.get("metadata", {}).get("observation_version")
+            or metadata.get("metadata", {}).get("dataset_config", {}).get("observation_version")
+        )
+        model.observation_metadata = dict(metadata.get("observation_metadata", {}))
         for name in model.params:
             model.params[name] = np.asarray(data[name], dtype=np.float64)
         return model
@@ -616,6 +660,7 @@ def policy_from_model(
     obstacle_map: GridMap | None = None,
     max_obstacle_tokens: int = 0,
     obstacle_context_range: float = 4.0,
+    observation_version: str | None = None,
 ):
     def _policy(positions, velocities, goals, radii):
         return model.predict_joint(
@@ -628,6 +673,7 @@ def policy_from_model(
             obstacle_map=obstacle_map,
             max_obstacle_tokens=max_obstacle_tokens,
             obstacle_context_range=obstacle_context_range,
+            observation_version=observation_version or getattr(model, "observation_version", "legacy"),
         )
 
     return _policy

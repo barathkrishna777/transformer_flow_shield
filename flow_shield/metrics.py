@@ -40,6 +40,11 @@ def aggregate_rollouts(rollouts: Iterable[Dict[str, object]], goals: List[np.nda
             "max_obstacle_separation_violation": 0.0,
             "mean_shield_correction_norm": 0.0,
             "max_shield_correction_norm": 0.0,
+            "correction_needed_rate": 0.0,
+            "mean_correction_target_norm": 0.0,
+            "max_correction_target_norm": 0.0,
+            "obstacle_intervention_rate": 0.0,
+            "pairwise_intervention_rate": 0.0,
             "mean_time_to_goal": 0.0,
             "mean_smoothness": 0.0,
             "deadlock_rate": 0.0,
@@ -88,6 +93,26 @@ def aggregate_rollouts(rollouts: Iterable[Dict[str, object]], goals: List[np.nda
         float(result.get("max_shield_correction_norm", 0.0))
         for result in materialized
     ]
+    correction_needed_rates = [
+        float(result.get("correction_needed_rate", 0.0))
+        for result in materialized
+    ]
+    mean_correction_target_norms = [
+        float(result.get("mean_correction_target_norm", result.get("mean_shield_correction_norm", 0.0)))
+        for result in materialized
+    ]
+    max_correction_target_norms = [
+        float(result.get("max_correction_target_norm", result.get("max_shield_correction_norm", 0.0)))
+        for result in materialized
+    ]
+    obstacle_intervention_rates = [
+        float(result.get("obstacle_intervention_rate", 0.0))
+        for result in materialized
+    ]
+    pairwise_intervention_rates = [
+        float(result.get("pairwise_intervention_rate", 0.0))
+        for result in materialized
+    ]
     deadlocks = []
     for result, goal_array in zip(materialized, goals):
         trajectory = result["trajectory"]
@@ -112,6 +137,11 @@ def aggregate_rollouts(rollouts: Iterable[Dict[str, object]], goals: List[np.nda
         "max_obstacle_separation_violation": float(np.max(max_obstacle_violations)),
         "mean_shield_correction_norm": float(np.mean(mean_shield_corrections)),
         "max_shield_correction_norm": float(np.max(max_shield_corrections)),
+        "correction_needed_rate": float(np.mean(correction_needed_rates)),
+        "mean_correction_target_norm": float(np.mean(mean_correction_target_norms)),
+        "max_correction_target_norm": float(np.max(max_correction_target_norms)),
+        "obstacle_intervention_rate": float(np.mean(obstacle_intervention_rates)),
+        "pairwise_intervention_rate": float(np.mean(pairwise_intervention_rates)),
         "mean_time_to_goal": float(np.mean(times)),
         "mean_smoothness": float(np.mean(smooth)),
         "deadlock_rate": float(np.mean(deadlocks)),

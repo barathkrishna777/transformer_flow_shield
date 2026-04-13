@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .benchmark import build_benchmark_plan, run_benchmark_plan
 from .config import DatasetConfig, ModelConfig, SimConfig
 from .dataset import build_dataset, load_dataset
 from .experiment import (
@@ -21,9 +22,20 @@ from .model import load_policy
 from .shield import DEFAULT_SHIELD_VARIANTS
 
 
+def _observation_version_for_args(args: argparse.Namespace, scenario_type: str) -> str:
+    requested = getattr(args, "observation_version", "auto")
+    if requested == "auto":
+        return "obstacle_waypoint_v2" if scenario_type == "obstacle_map" else "legacy"
+    return requested
+
+
 def _optional_sample_cap(value: str) -> int | None:
     parsed = int(value)
     return None if parsed <= 0 else parsed
+
+
+def _parse_int_list(value: str) -> tuple[int, ...]:
+    return tuple(int(part.strip()) for part in value.split(",") if part.strip())
 
 
 def _add_map_dataset_args(parser: argparse.ArgumentParser) -> None:
@@ -35,8 +47,30 @@ def _add_map_dataset_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--map", dest="map_path", type=Path, default=None)
     parser.add_argument("--map-cell-size", type=float, default=1.0)
+    parser.add_argument(
+        "--scenario-source",
+        choices=("sampled", "scen"),
+        default="sampled",
+    )
+    parser.add_argument("--scen", dest="scen_path", type=Path, default=None)
+    parser.add_argument("--scen-limit", type=int, default=None)
     parser.add_argument("--max-obstacle-tokens", type=int, default=0)
     parser.add_argument("--obstacle-context-range", type=float, default=4.0)
+    parser.add_argument(
+        "--observation-version",
+        choices=("auto", "legacy", "obstacle_waypoint_v2"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--expert-type",
+        choices=("independent_astar", "prioritized_astar"),
+        default="independent_astar",
+    )
+    parser.add_argument(
+        "--include-auxiliary-targets",
+        action="store_true",
+        help="Store optional Phase 5 shield-correction supervision targets in generated datasets.",
+    )
 
 
 def _add_shared_sim_args(
@@ -79,14 +113,24 @@ def _dataset_config(args: argparse.Namespace) -> DatasetConfig:
         max_neighbors=args.max_neighbors,
         min_start_goal_distance=getattr(args, "min_start_goal_distance", 3.0),
         scenario_type=scenario_type,
+        scenario_source=getattr(args, "scenario_source", "sampled"),
         map_path=(
             str(args.map_path)
             if getattr(args, "map_path", None) is not None
             else None
         ),
         map_cell_size=getattr(args, "map_cell_size", 1.0),
+        scen_path=(
+            str(args.scen_path)
+            if getattr(args, "scen_path", None) is not None
+            else None
+        ),
+        scen_limit=getattr(args, "scen_limit", None),
         max_obstacle_tokens=max_obstacle_tokens,
         obstacle_context_range=getattr(args, "obstacle_context_range", 4.0),
+        observation_version=_observation_version_for_args(args, scenario_type),
+        expert_type=getattr(args, "expert_type", "independent_astar"),
+        include_auxiliary_targets=getattr(args, "include_auxiliary_targets", False),
         seed=args.seed,
         max_samples=getattr(args, "max_samples", None),
     )
@@ -120,14 +164,24 @@ def _phase4_train_dataset_config(args: argparse.Namespace) -> DatasetConfig:
         max_neighbors=args.max_neighbors,
         min_start_goal_distance=args.min_start_goal_distance,
         scenario_type=scenario_type,
+        scenario_source=getattr(args, "scenario_source", "sampled"),
         map_path=(
             str(args.map_path)
             if getattr(args, "map_path", None) is not None
             else None
         ),
         map_cell_size=getattr(args, "map_cell_size", 1.0),
+        scen_path=(
+            str(args.scen_path)
+            if getattr(args, "scen_path", None) is not None
+            else None
+        ),
+        scen_limit=getattr(args, "scen_limit", None),
         max_obstacle_tokens=max_obstacle_tokens,
         obstacle_context_range=getattr(args, "obstacle_context_range", 4.0),
+        observation_version=_observation_version_for_args(args, scenario_type),
+        expert_type=getattr(args, "expert_type", "independent_astar"),
+        include_auxiliary_targets=getattr(args, "include_auxiliary_targets", False),
         seed=args.seed,
         max_samples=args.max_samples,
     )
@@ -147,14 +201,24 @@ def _phase4_eval_dataset_config(args: argparse.Namespace) -> DatasetConfig:
         max_neighbors=args.max_neighbors,
         min_start_goal_distance=args.min_start_goal_distance,
         scenario_type=scenario_type,
+        scenario_source=getattr(args, "scenario_source", "sampled"),
         map_path=(
             str(args.map_path)
             if getattr(args, "map_path", None) is not None
             else None
         ),
         map_cell_size=getattr(args, "map_cell_size", 1.0),
+        scen_path=(
+            str(args.scen_path)
+            if getattr(args, "scen_path", None) is not None
+            else None
+        ),
+        scen_limit=getattr(args, "scen_limit", None),
         max_obstacle_tokens=max_obstacle_tokens,
         obstacle_context_range=getattr(args, "obstacle_context_range", 4.0),
+        observation_version=_observation_version_for_args(args, scenario_type),
+        expert_type=getattr(args, "expert_type", "independent_astar"),
+        include_auxiliary_targets=getattr(args, "include_auxiliary_targets", False),
         seed=args.seed,
     )
 
@@ -167,10 +231,20 @@ def _phase3_train_dataset_config(args: argparse.Namespace) -> DatasetConfig:
         max_neighbors=args.max_neighbors,
         min_start_goal_distance=args.min_start_goal_distance,
         scenario_type="obstacle_map",
+        scenario_source=getattr(args, "scenario_source", "sampled"),
         map_path=str(args.map_path),
         map_cell_size=args.map_cell_size,
+        scen_path=(
+            str(args.scen_path)
+            if getattr(args, "scen_path", None) is not None
+            else None
+        ),
+        scen_limit=getattr(args, "scen_limit", None),
         max_obstacle_tokens=args.max_obstacle_tokens,
         obstacle_context_range=args.obstacle_context_range,
+        observation_version=_observation_version_for_args(args, "obstacle_map"),
+        expert_type=getattr(args, "expert_type", "independent_astar"),
+        include_auxiliary_targets=getattr(args, "include_auxiliary_targets", False),
         seed=args.seed,
         max_samples=args.max_samples,
     )
@@ -259,6 +333,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     phase3.add_argument("--map", dest="map_path", type=Path, required=True)
     phase3.add_argument("--map-cell-size", type=float, default=1.0)
+    phase3.add_argument(
+        "--scenario-source",
+        choices=("sampled", "scen"),
+        default="sampled",
+    )
+    phase3.add_argument("--scen", dest="scen_path", type=Path, default=None)
+    phase3.add_argument("--scen-limit", type=int, default=None)
     phase3.add_argument("--train-scenarios", type=int, default=24)
     phase3.add_argument("--eval-scenarios", type=int, default=8)
     phase3.add_argument("--horizon", type=int, default=80)
@@ -266,6 +347,21 @@ def build_parser() -> argparse.ArgumentParser:
     phase3.add_argument("--max-samples", type=_optional_sample_cap, default=50_000)
     phase3.add_argument("--max-obstacle-tokens", type=int, default=8)
     phase3.add_argument("--obstacle-context-range", type=float, default=4.0)
+    phase3.add_argument(
+        "--observation-version",
+        choices=("auto", "legacy", "obstacle_waypoint_v2"),
+        default="auto",
+    )
+    phase3.add_argument(
+        "--expert-type",
+        choices=("independent_astar", "prioritized_astar"),
+        default="independent_astar",
+    )
+    phase3.add_argument(
+        "--include-auxiliary-targets",
+        action="store_true",
+        help="Store optional Phase 5 shield-correction supervision targets in the Phase 3 dataset.",
+    )
     phase3.add_argument("--seed", type=int, default=307)
     phase3.add_argument(
         "--policy-type",
@@ -353,6 +449,37 @@ def build_parser() -> argparse.ArgumentParser:
     phase4_eval.add_argument("--max-iterations", type=int, default=12)
     phase4_eval.add_argument("--damping", type=float, default=1.0)
     phase4_eval.add_argument("--output", type=Path, default=Path("results/phase4_eval.json"))
+
+    benchmark = subparsers.add_parser(
+        "benchmark-obstacles",
+        help="Build or run Phase 7 Moving AI obstacle benchmark plans.",
+    )
+    benchmark.add_argument("--map-scen-list", type=Path, required=True)
+    benchmark.add_argument("--output-dir", type=Path, default=Path("runs/benchmarks/obstacles"))
+    benchmark.add_argument("--agent-counts", type=_parse_int_list, default=(4,))
+    benchmark.add_argument("--seeds", type=_parse_int_list, default=(7007,))
+    benchmark.add_argument("--train-scenarios", type=int, default=24)
+    benchmark.add_argument("--eval-scenarios", type=int, default=8)
+    benchmark.add_argument("--horizon", type=int, default=80)
+    benchmark.add_argument("--max-steps", type=int, default=160)
+    benchmark.add_argument("--max-neighbors", type=int, default=8)
+    benchmark.add_argument("--min-start-goal-distance", type=float, default=3.0)
+    benchmark.add_argument("--max-samples", type=_optional_sample_cap, default=50_000)
+    benchmark.add_argument("--max-obstacle-tokens", type=int, default=8)
+    benchmark.add_argument("--obstacle-context-range", type=float, default=4.0)
+    benchmark.add_argument(
+        "--observation-version",
+        choices=("legacy", "obstacle_waypoint_v2"),
+        default="obstacle_waypoint_v2",
+    )
+    benchmark.add_argument(
+        "--expert-type",
+        choices=("independent_astar", "prioritized_astar"),
+        default="independent_astar",
+    )
+    benchmark.add_argument("--limit", type=int, default=None)
+    benchmark.add_argument("--smoke", action="store_true")
+    benchmark.add_argument("--plan-only", "--dry-run", action="store_true", dest="plan_only")
 
     return parser
 
@@ -465,6 +592,34 @@ def main() -> None:
             damping=args.damping,
         )
         print(json.dumps(result["metrics"], indent=2))
+        return
+
+    if args.command == "benchmark-obstacles":
+        plan = build_benchmark_plan(
+            map_scen_list=args.map_scen_list,
+            output_dir=args.output_dir,
+            agent_counts=args.agent_counts,
+            seeds=args.seeds,
+            train_scenarios=args.train_scenarios,
+            eval_scenarios=args.eval_scenarios,
+            horizon=args.horizon,
+            max_steps=args.max_steps,
+            max_neighbors=args.max_neighbors,
+            min_start_goal_distance=args.min_start_goal_distance,
+            max_samples=args.max_samples,
+            max_obstacle_tokens=args.max_obstacle_tokens,
+            obstacle_context_range=args.obstacle_context_range,
+            observation_version=args.observation_version,
+            expert_type=args.expert_type,
+            limit=args.limit,
+            smoke=args.smoke,
+        )
+        summary = run_benchmark_plan(
+            plan,
+            output_dir=args.output_dir,
+            plan_only=args.plan_only,
+        )
+        print(json.dumps(summary, indent=2))
         return
 
 

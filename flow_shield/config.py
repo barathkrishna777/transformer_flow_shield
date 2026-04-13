@@ -32,10 +32,16 @@ class DatasetConfig:
     max_neighbors: int = 8
     min_start_goal_distance: float = 3.0
     scenario_type: str = "empty"
+    scenario_source: str = "sampled"
     map_path: Optional[str] = None
     map_cell_size: float = 1.0
+    scen_path: Optional[str] = None
+    scen_limit: Optional[int] = None
     max_obstacle_tokens: int = 0
     obstacle_context_range: float = 4.0
+    observation_version: str = "legacy"
+    expert_type: str = "independent_astar"
+    include_auxiliary_targets: bool = False
     seed: int = 7
     include_reached_agents: bool = False
     max_samples: Optional[int] = None
@@ -93,10 +99,16 @@ class Phase4Config:
         "pibt",
     )
     scenario_type: str = "empty"
+    scenario_source: str = "sampled"
     map_path: Optional[str] = None
     map_cell_size: float = 1.0
+    scen_path: Optional[str] = None
+    scen_limit: Optional[int] = None
     max_obstacle_tokens: int = 0
     obstacle_context_range: float = 4.0
+    observation_version: str = "legacy"
+    expert_type: str = "independent_astar"
+    include_auxiliary_targets: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -118,10 +130,16 @@ def phase4_component_configs(
         max_neighbors=config.max_neighbors,
         min_start_goal_distance=config.min_start_goal_distance,
         scenario_type=config.scenario_type,
+        scenario_source=config.scenario_source,
         map_path=config.map_path,
         map_cell_size=config.map_cell_size,
+        scen_path=config.scen_path,
+        scen_limit=config.scen_limit,
         max_obstacle_tokens=config.max_obstacle_tokens,
         obstacle_context_range=config.obstacle_context_range,
+        observation_version=config.observation_version,
+        expert_type=config.expert_type,
+        include_auxiliary_targets=config.include_auxiliary_targets,
         seed=config.seed,
         max_samples=config.max_samples,
     )
@@ -132,10 +150,16 @@ def phase4_component_configs(
         max_neighbors=config.max_neighbors,
         min_start_goal_distance=config.min_start_goal_distance,
         scenario_type=config.scenario_type,
+        scenario_source=config.scenario_source,
         map_path=config.map_path,
         map_cell_size=config.map_cell_size,
+        scen_path=config.scen_path,
+        scen_limit=config.scen_limit,
         max_obstacle_tokens=config.max_obstacle_tokens,
         obstacle_context_range=config.obstacle_context_range,
+        observation_version=config.observation_version,
+        expert_type=config.expert_type,
+        include_auxiliary_targets=config.include_auxiliary_targets,
         seed=config.seed + 10_000,
         max_samples=None,
     )

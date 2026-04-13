@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import heapq
+from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .config import DatasetConfig, SimConfig
 from .geometry import clip_by_norm, collision_pairs, project_positions_to_bounds
-from .maps import GridMap, load_obstacle_map
+from .maps import GridMap, MovingAIScenarioTask, load_moving_ai_scen, load_obstacle_map
 from .simulator import ContinuousWorld, Scenario, sim_config_for_scenario
 
 
@@ -64,6 +65,27 @@ _NEIGHBOR_DELTAS = (
     (1, -1, np.sqrt(2.0)),
     (1, 1, np.sqrt(2.0)),
 )
+_WAIT_DELTA = (0, 0, 1.0)
+
+
+def normalize_expert_type(expert_type: str | None) -> str:
+    normalized = (expert_type or "independent_astar").strip().lower().replace("-", "_")
+    aliases = {
+        "independent": "independent_astar",
+        "astar": "independent_astar",
+        "independent_astar": "independent_astar",
+        "waypoint_astar": "independent_astar",
+        "prioritized": "prioritized_astar",
+        "reservation": "prioritized_astar",
+        "reservation_astar": "prioritized_astar",
+        "prioritized_astar": "prioritized_astar",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unsupported expert_type={expert_type!r}; expected 'independent_astar' "
+            "or 'prioritized_astar'."
+        )
+    return aliases[normalized]
 
 
 def _cell_has_clearance(
@@ -177,6 +199,82 @@ def astar_grid_path(
     return None
 
 
+def _astar_grid_path_with_reservations(
+    obstacle_map: GridMap,
+    start: np.ndarray,
+    goal: np.ndarray,
+    radius: float,
+    margin: float,
+    reserved_vertices: set[Tuple[int, Tuple[int, int]]],
+    reserved_edges: set[Tuple[int, Tuple[int, int], Tuple[int, int]]],
+    max_time: int,
+) -> Optional[List[Tuple[int, int]]]:
+    """Time-expanded A* with vertex/edge reservations and wait actions."""
+
+    start_cell = _nearest_clear_cell(obstacle_map, start, radius, margin)
+    goal_cell = _nearest_clear_cell(obstacle_map, goal, radius, margin)
+    if start_cell is None or goal_cell is None:
+        return None
+    if (0, start_cell) in reserved_vertices:
+        return None
+
+    open_heap: List[Tuple[float, float, int, Tuple[int, int]]] = []
+    heapq.heappush(
+        open_heap,
+        (_octile_heuristic(start_cell, goal_cell), 0.0, 0, start_cell),
+    )
+    came_from: Dict[Tuple[int, Tuple[int, int]], Tuple[int, Tuple[int, int]]] = {}
+    best_cost: Dict[Tuple[int, Tuple[int, int]], float] = {(0, start_cell): 0.0}
+    closed = set()
+    moves = _NEIGHBOR_DELTAS + (_WAIT_DELTA,)
+
+    while open_heap:
+        _, cost, time_step, cell = heapq.heappop(open_heap)
+        state = (time_step, cell)
+        if state in closed:
+            continue
+        if cell == goal_cell:
+            path = [cell]
+            while state in came_from:
+                state = came_from[state]
+                path.append(state[1])
+            return list(reversed(path))
+        if time_step >= max_time:
+            continue
+        closed.add(state)
+        row, col = cell
+        for dr, dc, step_cost in moves:
+            next_cell = (row + dr, col + dc)
+            next_time = time_step + 1
+            if not _cell_has_clearance(
+                obstacle_map,
+                next_cell[0],
+                next_cell[1],
+                radius,
+                margin,
+            ):
+                continue
+            if dr != 0 and dc != 0:
+                if not (
+                    _cell_has_clearance(obstacle_map, row + dr, col, radius, margin)
+                    and _cell_has_clearance(obstacle_map, row, col + dc, radius, margin)
+                ):
+                    continue
+            if (next_time, next_cell) in reserved_vertices:
+                continue
+            if (next_time, cell, next_cell) in reserved_edges:
+                continue
+            next_state = (next_time, next_cell)
+            new_cost = cost + float(step_cost)
+            if new_cost + 1e-12 >= best_cost.get(next_state, np.inf):
+                continue
+            best_cost[next_state] = new_cost
+            came_from[next_state] = state
+            priority = new_cost + _octile_heuristic(next_cell, goal_cell)
+            heapq.heappush(open_heap, (priority, new_cost, next_time, next_cell))
+    return None
+
+
 def obstacle_map_velocity(
     positions: np.ndarray,
     goals: np.ndarray,
@@ -218,6 +316,107 @@ def obstacle_map_velocity(
         else:
             targets[index] = goal
     return straight_line_velocity(positions, targets, config)
+
+
+def prioritized_obstacle_map_velocity(
+    positions: np.ndarray,
+    goals: np.ndarray,
+    config: SimConfig,
+    obstacle_map: GridMap,
+    radii: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Reservation-table A* waypoint expert baseline for obstacle maps.
+
+    This is a lightweight prioritized planner: agents are ordered by remaining
+    distance and planned one by one with vertex and edge reservations. It is a
+    coordination baseline, not a complete joint MAPF solver.
+    """
+
+    positions = np.asarray(positions, dtype=np.float64)
+    goals = np.asarray(goals, dtype=np.float64)
+    radii = (
+        np.full(positions.shape[0], config.agent_radius, dtype=np.float64)
+        if radii is None
+        else np.asarray(radii, dtype=np.float64)
+    )
+    targets = goals.copy()
+    reservations: set[Tuple[int, Tuple[int, int]]] = set()
+    edge_reservations: set[Tuple[int, Tuple[int, int], Tuple[int, int]]] = set()
+    waypoint_tolerance = max(config.goal_tolerance * 0.75, config.agent_radius * 1.5)
+    remaining = np.linalg.norm(goals - positions, axis=1)
+    order = np.lexsort((np.arange(positions.shape[0]), -remaining))
+    max_time = max(
+        8,
+        int((obstacle_map.width + obstacle_map.height) * 4 + positions.shape[0] * 2),
+    )
+    for index in order:
+        index = int(index)
+        position = positions[index]
+        goal = goals[index]
+        radius = float(radii[index])
+        if np.linalg.norm(goal - position) <= config.goal_tolerance:
+            targets[index] = position
+            start_cell = _nearest_clear_cell(obstacle_map, position, radius, config.safety_margin)
+            if start_cell is not None:
+                reservations.add((0, start_cell))
+            continue
+        path = _astar_grid_path_with_reservations(
+            obstacle_map,
+            position,
+            goal,
+            radius,
+            margin=config.safety_margin,
+            reserved_vertices=reservations,
+            reserved_edges=edge_reservations,
+            max_time=max_time,
+        )
+        if not path:
+            path = astar_grid_path(
+                obstacle_map,
+                position,
+                goal,
+                radius,
+                margin=config.safety_margin,
+            )
+        if not path:
+            targets[index] = position
+            continue
+        for time_step, cell in enumerate(path):
+            reservations.add((time_step, cell))
+            if time_step > 0:
+                prev = path[time_step - 1]
+                edge_reservations.add((time_step, cell, prev))
+        for time_step in range(len(path), min(max_time, len(path) + 8)):
+            reservations.add((time_step, path[-1]))
+        waypoints = [obstacle_map.cell_center(row, col) for row, col in path[1:]]
+        waypoints.append(goal)
+        for waypoint in waypoints:
+            if np.linalg.norm(waypoint - position) > waypoint_tolerance:
+                targets[index] = waypoint
+                break
+        else:
+            targets[index] = goal
+    return straight_line_velocity(positions, targets, config)
+
+
+def obstacle_map_expert_velocity(
+    positions: np.ndarray,
+    goals: np.ndarray,
+    config: SimConfig,
+    obstacle_map: GridMap,
+    radii: Optional[np.ndarray] = None,
+    expert_type: str = "independent_astar",
+) -> np.ndarray:
+    expert_type = normalize_expert_type(expert_type)
+    if expert_type == "prioritized_astar":
+        return prioritized_obstacle_map_velocity(
+            positions,
+            goals,
+            config,
+            obstacle_map,
+            radii=radii,
+        )
+    return obstacle_map_velocity(positions, goals, config, obstacle_map, radii=radii)
 
 
 def _sample_points(
@@ -417,10 +616,216 @@ def sample_obstacle_map_scenario(
     )
 
 
+SCEN_SKIP_REASONS = (
+    "map_dimension_mismatch",
+    "start_collision",
+    "goal_collision",
+    "too_short_start_goal_distance",
+    "unreachable_astar",
+    "grouping_overlap",
+    "insufficient_valid_tasks",
+)
+
+
+def _scen_task_skip_reason(
+    task: MovingAIScenarioTask,
+    sim_config: SimConfig,
+    dataset_config: DatasetConfig,
+    obstacle_map: GridMap,
+) -> Optional[str]:
+    radius = float(sim_config.agent_radius)
+    margin = float(sim_config.safety_margin)
+    if task.map_width != obstacle_map.width or task.map_height != obstacle_map.height:
+        return "map_dimension_mismatch"
+    if np.linalg.norm(task.goal - task.start) < dataset_config.min_start_goal_distance:
+        return "too_short_start_goal_distance"
+    if obstacle_map.circle_collides(task.start, radius, margin=margin):
+        return "start_collision"
+    if obstacle_map.circle_collides(task.goal, radius, margin=margin):
+        return "goal_collision"
+    if astar_grid_path(obstacle_map, task.start, task.goal, radius, margin=margin) is None:
+        return "unreachable_astar"
+    return None
+
+
+def _valid_scen_task(
+    task: MovingAIScenarioTask,
+    sim_config: SimConfig,
+    dataset_config: DatasetConfig,
+    obstacle_map: GridMap,
+) -> bool:
+    return _scen_task_skip_reason(task, sim_config, dataset_config, obstacle_map) is None
+
+
+def scen_task_diagnostics(
+    dataset_config: DatasetConfig,
+    sim_config: SimConfig,
+    obstacle_map: GridMap,
+) -> Dict[str, object]:
+    """Return Moving AI .scen validity counts before multi-agent grouping."""
+
+    if dataset_config.scen_path is None:
+        return {
+            "scenario_source": dataset_config.scenario_source,
+            "raw_tasks": 0,
+            "valid_tasks": 0,
+            "skipped_tasks": 0,
+            "skip_counts": {reason: 0 for reason in SCEN_SKIP_REASONS},
+        }
+    raw_tasks = load_moving_ai_scen(
+        dataset_config.scen_path,
+        cell_size=obstacle_map.cell_size,
+        limit=dataset_config.scen_limit,
+    )
+    skip_counts = Counter({reason: 0 for reason in SCEN_SKIP_REASONS})
+    valid = 0
+    for task in raw_tasks:
+        reason = _scen_task_skip_reason(task, sim_config, dataset_config, obstacle_map)
+        if reason is None:
+            valid += 1
+        else:
+            skip_counts[reason] += 1
+    return {
+        "scenario_source": dataset_config.scenario_source,
+        "scen_path": dataset_config.scen_path,
+        "scen_limit": dataset_config.scen_limit,
+        "raw_tasks": len(raw_tasks),
+        "valid_tasks": int(valid),
+        "skipped_tasks": len(raw_tasks) - int(valid),
+        "skip_counts": dict(skip_counts),
+    }
+
+
+def _group_has_overlap(
+    group: List[MovingAIScenarioTask],
+    map_config: SimConfig,
+    min_pair_distance: float,
+) -> bool:
+    if len(group) <= 1:
+        return False
+    starts = np.stack([task.start for task in group], axis=0)
+    goals = np.stack([task.goal for task in group], axis=0)
+    radii = np.full(len(group), map_config.agent_radius, dtype=np.float64)
+    if collision_pairs(starts, radii, margin=map_config.safety_margin):
+        return True
+    if collision_pairs(goals, radii, margin=map_config.safety_margin):
+        return True
+    start_distances = np.linalg.norm(starts[:, None, :] - starts[None, :, :], axis=-1)
+    goal_distances = np.linalg.norm(goals[:, None, :] - goals[None, :, :], axis=-1)
+    np.fill_diagonal(start_distances, np.inf)
+    np.fill_diagonal(goal_distances, np.inf)
+    return bool(
+        np.min(start_distances) < min_pair_distance
+        or np.min(goal_distances) < min_pair_distance
+    )
+
+
+def _select_scen_group(
+    valid: List[MovingAIScenarioTask],
+    available: List[int],
+    rng: np.random.Generator,
+    num_agents: int,
+    map_config: SimConfig,
+    min_pair_distance: float,
+) -> Optional[List[int]]:
+    if len(available) < num_agents:
+        return None
+    ordered = list(rng.permutation(np.asarray(available, dtype=np.int64)))
+    group_indices: List[int] = []
+    for candidate_index in ordered:
+        trial = group_indices + [int(candidate_index)]
+        trial_group = [valid[index] for index in trial]
+        if _group_has_overlap(trial_group, map_config, min_pair_distance):
+            continue
+        group_indices = trial
+        if len(group_indices) == num_agents:
+            return group_indices
+    return None
+
+
+def sample_scen_scenarios(
+    dataset_config: DatasetConfig,
+    sim_config: SimConfig,
+    obstacle_map: GridMap,
+) -> List[Scenario]:
+    """Build multi-agent scenarios from standard Moving AI .scen tasks."""
+
+    if dataset_config.scen_path is None:
+        raise ValueError("scenario_source='scen' requires DatasetConfig.scen_path.")
+    map_config = sim_config_for_scenario(
+        sim_config,
+        Scenario(
+            starts=np.empty((0, 2), dtype=np.float64),
+            goals=np.empty((0, 2), dtype=np.float64),
+            radii=np.empty((0,), dtype=np.float64),
+            world_size=obstacle_map.world_size,
+            obstacle_map=obstacle_map,
+        ),
+    )
+    raw_tasks = load_moving_ai_scen(
+        dataset_config.scen_path,
+        cell_size=obstacle_map.cell_size,
+        limit=dataset_config.scen_limit,
+    )
+    valid = [
+        task
+        for task in raw_tasks
+        if _valid_scen_task(task, map_config, dataset_config, obstacle_map)
+    ]
+    scenarios: List[Scenario] = []
+    min_pair_distance = 2.5 * map_config.agent_radius + map_config.safety_margin
+    rng = np.random.default_rng(dataset_config.seed)
+    available = list(range(len(valid)))
+    overlap_skips = 0
+    while len(scenarios) < dataset_config.num_scenarios:
+        group_indices = _select_scen_group(
+            valid,
+            available,
+            rng,
+            dataset_config.num_agents,
+            map_config,
+            min_pair_distance,
+        )
+        if group_indices is None:
+            break
+        group = [valid[index] for index in group_indices]
+        for index in group_indices:
+            available.remove(index)
+        starts = np.stack([task.start for task in group], axis=0)
+        goals = np.stack([task.goal for task in group], axis=0)
+        radii = np.full(dataset_config.num_agents, map_config.agent_radius, dtype=np.float64)
+        if _group_has_overlap(group, map_config, min_pair_distance):
+            overlap_skips += 1
+            continue
+        scenarios.append(
+            Scenario(
+                starts=starts,
+                goals=goals,
+                radii=radii,
+                world_size=obstacle_map.world_size,
+                obstacle_map=obstacle_map,
+            )
+        )
+    if len(scenarios) != dataset_config.num_scenarios:
+        diagnostics = scen_task_diagnostics(dataset_config, map_config, obstacle_map)
+        skip_counts = dict(diagnostics.get("skip_counts", {}))
+        skip_counts["grouping_overlap"] = skip_counts.get("grouping_overlap", 0) + overlap_skips
+        if len(valid) < dataset_config.num_agents:
+            skip_counts["insufficient_valid_tasks"] = 1
+        raise RuntimeError(
+            "Could not build enough valid scenarios from .scen tasks; "
+            f"requested {dataset_config.num_scenarios}, built {len(scenarios)}, "
+            f"valid_tasks={len(valid)}, raw_tasks={len(raw_tasks)}, "
+            f"skip_counts={skip_counts}."
+        )
+    return scenarios
+
+
 def rollout_expert(
     scenario: Scenario,
     sim_config: SimConfig,
     horizon: int,
+    expert_type: str = "independent_astar",
 ) -> List[dict]:
     """Roll out the phase 0 expert and return pre-step states plus targets."""
 
@@ -429,12 +834,13 @@ def rollout_expert(
     for _ in range(horizon):
         scenario_config = sim_config_for_scenario(sim_config, scenario)
         if scenario.obstacle_map is not None:
-            target_velocity = obstacle_map_velocity(
+            target_velocity = obstacle_map_expert_velocity(
                 world.positions,
                 world.goals,
                 scenario_config,
                 scenario.obstacle_map,
                 radii=world.radii,
+                expert_type=expert_type,
             )
         elif scenario.static_obstacles:
             target_velocity = obstacle_aware_velocity(
@@ -479,13 +885,24 @@ def generate_scenarios(
         cell_size=dataset_config.map_cell_size,
     )
     scenario_type = dataset_config.scenario_type.strip().lower().replace("-", "_")
+    scenario_source = dataset_config.scenario_source.strip().lower().replace("-", "_")
     if scenario_type in {"moving_ai", "moving_ai_map", "map"}:
         scenario_type = "obstacle_map"
     if scenario_type == "obstacle_map" and obstacle_map is None:
         raise ValueError("scenario_type='obstacle_map' requires DatasetConfig.map_path.")
     if scenario_type == "empty" and obstacle_map is not None:
         scenario_type = "obstacle_map"
-    for _ in range(dataset_config.num_scenarios):
+    if scenario_source == "scen":
+        if scenario_type != "obstacle_map" or obstacle_map is None:
+            raise ValueError("scenario_source='scen' requires an obstacle_map and map_path.")
+        scenarios = sample_scen_scenarios(dataset_config, sim_config, obstacle_map)
+    elif scenario_source != "sampled":
+        raise ValueError(
+            f"Unsupported scenario_source={dataset_config.scenario_source!r}; "
+            "expected 'sampled' or 'scen'."
+        )
+
+    for _ in range(0 if scenarios else dataset_config.num_scenarios):
         if scenario_type not in {"empty", "obstacle_map"}:
             raise ValueError(
                 f"Unsupported scenario_type={dataset_config.scenario_type!r}; "
